@@ -1,0 +1,25 @@
+{
+  "name": "dufs_core",
+  "display_name": "Dufs Core",
+  "icon": "icon.png",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "universal",
+  "category": "tools",
+  "description": "Talks to dufs file servers over HTTP: list, upload, download, rename, delete, previews",
+  "main": "dufs_core_plugin",
+  "dependencies": [],
+  "nix": {
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "external_libraries": [],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": ["src"],
+      "extra_link_libraries": []
+    }
+  }
+}

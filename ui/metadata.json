@@ -1,0 +1,26 @@
+{
+  "name": "dufs",
+  "display_name": "Dufs",
+  "icon": "icon.png",
+  "version": "0.1.0",
+  "type": "ui_qml",
+  "category": "tools",
+  "description": "Browse, preview, upload and download files on your dufs servers - several servers, one switcher",
+  "view": "Main.qml",
+  "dependencies": [
+    "dufs_core"
+  ],
+  "nix": {
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "external_libraries": [],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": [],
+      "extra_link_libraries": []
+    }
+  }
+}
