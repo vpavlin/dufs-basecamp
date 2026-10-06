@@ -29,7 +29,7 @@ cd core && nix build .#lgx-portable    # dufs_core
 cd ui   && nix build .#lgx-portable    # dufs (view)
 ```
 
-Both use `logos-module-builder` 0.3.1.
+Both use `logos-module-builder` 0.3.1. Published packages carry `linux-amd64` and `linux-arm64` (the ARM variant is built by `.github/workflows/platform-modules.yml` on `ubuntu-24.04-arm` and merged with `lgx merge`).
 
 ## Test
 
