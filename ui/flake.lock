@@ -175,14 +175,21 @@
         ]
       },
       "locked": {
-        "path": "../core",
-        "type": "path"
+        "dir": "core",
+        "lastModified": 1791301933,
+        "narHash": "sha256-/I9BVIqdQNUn20x7W/Msk99mmEoWaIhQEZku4xaFt8Q=",
+        "owner": "vpavlin",
+        "repo": "dufs-basecamp",
+        "rev": "f99d8168daf87a4dd86cc71639ef8ee1b63cdb1f",
+        "type": "github"
       },
       "original": {
-        "path": "../core",
-        "type": "path"
-      },
-      "parent": []
+        "dir": "core",
+        "owner": "vpavlin",
+        "repo": "dufs-basecamp",
+        "rev": "f99d8168daf87a4dd86cc71639ef8ee1b63cdb1f",
+        "type": "github"
+      }
     },
     "logos-capability-module": {
       "inputs": {

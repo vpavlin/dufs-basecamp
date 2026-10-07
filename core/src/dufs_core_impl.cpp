@@ -10,6 +10,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
+#include <QStandardPaths>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
@@ -18,7 +19,11 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <memory>
 #include <deque>
 #include <filesystem>
@@ -30,7 +35,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.0";
+static const char* kVersion = "0.1.1";
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
 static const int kMaxPreviewJobs = 3;
@@ -46,6 +51,40 @@ static std::string dataDir()
     return "/tmp/.dufs-basecamp";
 }
 
+// Typed reads that never throw. json::value() throws on a field of another type, and a reply from a
+// server (or anything on the path of a plain-http connection) can have any shape.
+static std::string jstr(const json& o, const char* k, const std::string& def)
+{
+    if (!o.is_object()) return def;
+    auto it = o.find(k);
+    return (it != o.end() && it->is_string()) ? it->get<std::string>() : def;
+}
+static int64_t jnum(const json& o, const char* k, int64_t def)
+{
+    if (!o.is_object()) return def;
+    auto it = o.find(k);
+    if (it == o.end() || !it->is_number()) return def;
+    return it->is_number_float() ? (int64_t)it->get<double>() : it->get<int64_t>();
+}
+static bool jbool(const json& o, const char* k, bool def)
+{
+    if (!o.is_object()) return def;
+    auto it = o.find(k);
+    return (it != o.end() && it->is_boolean()) ? it->get<bool>() : def;
+}
+
+// Every network callback runs inside a Qt signal: an exception escaping it terminates the whole
+// module process. Wrap them all; log what was swallowed.
+template <typename F>
+static auto guarded(const char* where, F fn)
+{
+    return [where, fn](auto&&... args) mutable {
+        try { fn(std::forward<decltype(args)>(args)...); }
+        catch (const std::exception& e) { std::fprintf(stderr, "[dufs_core] %s: %s\n", where, e.what()); }
+        catch (...) { std::fprintf(stderr, "[dufs_core] %s: unknown exception\n", where); }
+    };
+}
+
 static json readJsonFile(const std::string& path)
 {
     std::ifstream f(path);
@@ -54,15 +93,31 @@ static json readJsonFile(const std::string& path)
     return json::parse(ss.str(), nullptr, false);
 }
 
-// Atomic write, owner-only (the file can hold server passwords).
+// Atomic write, owner-only from the first byte (the file can hold server passwords).
 static void writeJsonFile(const std::string& path, const json& j)
 {
     const std::string tmp = path + ".tmp";
-    { std::ofstream f(tmp); if (!f) return; f << j.dump(2); }
+    const std::string body = j.dump(2);
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    ::fchmod(fd, 0600);
+    size_t off = 0;
+    while (off < body.size()) {
+        ssize_t n = ::write(fd, body.data() + off, body.size() - off);
+        if (n <= 0) { ::close(fd); ::unlink(tmp.c_str()); return; }
+        off += (size_t)n;
+    }
+    ::close(fd);
     std::error_code ec;
-    fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
     fs::rename(tmp, path, ec);
     if (ec) fs::remove(tmp, ec);
+}
+
+static void ensurePrivateDir(const std::string& d)
+{
+    std::error_code ec;
+    fs::create_directories(d, ec);
+    fs::permissions(d, fs::perms::owner_all, fs::perm_options::replace, ec);
 }
 
 static std::string lower(std::string s)
@@ -135,6 +190,10 @@ static std::string localPathFrom(std::string p)
 
 static std::string httpError(QNetworkReply* r)
 {
+    const QString moved = r->property("dufsRedirect").toString();
+    if (!moved.isEmpty())
+        return "The server redirected to another address (" + moved.toStdString() +
+               "). Not followed, so your login is not sent there. Add that address as a server if you trust it.";
     const int code = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     switch (code) {
         case 401: return "The server wants a login, or the user name or password is wrong.";
@@ -224,17 +283,21 @@ struct DufsCorePrivate {
     std::string serversFile() const { return dataDir() + "/servers.json"; }
     void load()
     {
-        std::error_code ec; fs::create_directories(dataDir(), ec);
+        ensurePrivateDir(dataDir());
         json j = readJsonFile(serversFile());
         if (!j.is_object()) return;
-        for (auto& s : j.value("servers", json::array())) {
-            Server sv;
-            sv.id = s.value("id", ""); sv.name = s.value("name", ""); sv.url = s.value("url", "");
-            sv.user = s.value("user", ""); sv.password = s.value("password", "");
-            sv.lastPath = s.value("lastPath", "/");
-            if (!sv.id.empty() && !sv.url.empty()) servers.push_back(sv);
+        auto it = j.find("servers");
+        if (it != j.end() && it->is_array()) {
+            for (auto& s : *it) {
+                if (!s.is_object()) continue;
+                Server sv;
+                sv.id = jstr(s, "id", ""); sv.name = jstr(s, "name", ""); sv.url = jstr(s, "url", "");
+                sv.user = jstr(s, "user", ""); sv.password = jstr(s, "password", "");
+                sv.lastPath = jstr(s, "lastPath", "/");
+                if (!sv.id.empty() && !sv.url.empty()) servers.push_back(sv);
+            }
         }
-        currentId = j.value("current", "");
+        currentId = jstr(j, "current", "");
         if (!find(currentId)) currentId = servers.empty() ? "" : servers.front().id;
         if (auto* s = current()) path = normDir(s->lastPath);
     }
@@ -271,12 +334,32 @@ struct DufsCorePrivate {
     QNetworkRequest request(const Server& s, const QUrl& u, int timeoutMs) const
     {
         QNetworkRequest r(u);
-        r.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        // Redirects are checked per reply (watch()): only within the same scheme, host and port,
+        // because the login travels as a header and must never reach another host.
+        r.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::UserVerifiedRedirectPolicy);
         r.setTransferTimeout(timeoutMs);
         if (!s.user.empty()) {
             QByteArray cred = QByteArray::fromStdString(s.user + ":" + s.password).toBase64();
             r.setRawHeader("Authorization", "Basic " + cred);
         }
+        return r;
+    }
+
+    // Follow a redirect only if it stays on the same origin as the request; otherwise stop with an
+    // error the user can read (httpError picks up the "dufsRedirect" property).
+    QNetworkReply* watch(QNetworkReply* r)
+    {
+        const QUrl origin = r->request().url();
+        QObject::connect(r, &QNetworkReply::redirected, guarded("redirect", [r, origin](const QUrl& to) {
+            const QUrl dest = origin.resolved(to);
+            if (dest.scheme() == origin.scheme() && dest.host() == origin.host()
+                && dest.port(origin.scheme() == "https" ? 443 : 80) == origin.port(origin.scheme() == "https" ? 443 : 80)) {
+                r->redirectAllowed();
+            } else {
+                r->setProperty("dufsRedirect", dest.toString(QUrl::RemoveUserInfo | QUrl::RemoveQuery));
+                r->abort();
+            }
+        }));
         return r;
     }
 
@@ -328,6 +411,7 @@ struct DufsCorePrivate {
             {"transfers", tr},
             {"previews", pv},
             {"previewCache", !viewDir.empty()},
+            {"downloadsDir", QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString()},
             {"notice", notice},
             {"noticeKind", noticeKind},
             {"noticeAt", noticeAt},
@@ -351,10 +435,10 @@ struct DufsCorePrivate {
         if (!query.empty()) qq.addQueryItem("q", QString::fromStdString(query));
         qq.addQueryItem("json", "");
         u.setQuery(qq);
-        QNetworkReply* r = net()->get(request(*s, u, 15000));
+        QNetworkReply* r = watch(net()->get(request(*s, u, 15000)));
         listReply = r;
         const std::string sid = s->id;
-        QObject::connect(r, &QNetworkReply::finished, [this, r, gen, sid] {
+        QObject::connect(r, &QNetworkReply::finished, guarded("list", [this, r, gen, sid] {
             r->deleteLater();
             if (gen != listGen) return;
             listReply = nullptr;
@@ -366,30 +450,33 @@ struct DufsCorePrivate {
                 return;
             }
             json j = json::parse(r->readAll().toStdString(), nullptr, false);
-            if (!j.is_object() || !j.contains("paths")) {
+            auto pathsIt = j.is_object() ? j.find("paths") : j.end();
+            if (!j.is_object() || pathsIt == j.end() || !pathsIt->is_array()) {
                 listError = "That address answered, but not like a dufs server (no JSON listing).";
+                perms = json::object();
                 changed();
                 return;
             }
-            if (!j.value("dir_exists", true) && query.empty()) {
+            if (!jbool(j, "dir_exists", true) && query.empty()) {
                 listError = "This folder does not exist on the server (any more).";
                 changed();
                 return;
             }
-            perms = {{"upload", j.value("allow_upload", false)}, {"delete", j.value("allow_delete", false)},
-                     {"search", j.value("allow_search", false)}, {"archive", j.value("allow_archive", false)}};
+            perms = {{"upload", jbool(j, "allow_upload", false)}, {"delete", jbool(j, "allow_delete", false)},
+                     {"search", jbool(j, "allow_search", false)}, {"archive", jbool(j, "allow_archive", false)}};
             Server* sv = find(sid);
             std::vector<json> dirs, files;
-            for (auto& p : j["paths"]) {
-                const std::string type = p.value("path_type", "File");
+            for (auto& p : *pathsIt) {
+                if (!p.is_object()) continue;
+                const std::string type = jstr(p, "path_type", "File");
                 const bool dir = type.find("Dir") != std::string::npos;
-                const std::string name = p.value("name", "");
-                if (name.empty()) continue;
+                const std::string name = jstr(p, "name", "");
+                if (name.empty() || name.find('\0') != std::string::npos) continue;
                 // In search results dufs gives the path relative to the searched folder.
                 std::string full = path + name;
                 if (dir) full = normDir(full);
                 json e = {{"name", baseName(full)}, {"rel", name}, {"path", full}, {"dir", dir}, {"kind", kindOf(name, dir)},
-                          {"size", p.value("size", (int64_t)0)}, {"mtime", p.value("mtime", (int64_t)0)},
+                          {"size", jnum(p, "size", 0)}, {"mtime", jnum(p, "mtime", 0)},
                           {"url", sv ? publicUrl(*sv, full) : ""}};
                 (dir ? dirs : files).push_back(e);
             }
@@ -401,7 +488,7 @@ struct DufsCorePrivate {
             for (auto& e : dirs) entries.push_back(e);
             for (auto& e : files) entries.push_back(e);
             changed();
-        });
+        }));
     }
 
     void simpleOp(const QByteArray& verb, const std::string& target, const std::string& destination,
@@ -414,13 +501,13 @@ struct DufsCorePrivate {
             req.setRawHeader("Destination", urlFor(*s, destination).toString(QUrl::FullyEncoded).toUtf8());
             req.setRawHeader("Overwrite", "F");
         }
-        QNetworkReply* r = net()->sendCustomRequest(req, verb);
-        QObject::connect(r, &QNetworkReply::finished, [this, r, okMsg] {
+        QNetworkReply* r = watch(net()->sendCustomRequest(req, verb));
+        QObject::connect(r, &QNetworkReply::finished, guarded("op", [this, r, okMsg] {
             r->deleteLater();
             if (r->error() != QNetworkReply::NoError) note(httpError(r), "error");
             else note(okMsg, "ok");
             list();
-        });
+        }));
     }
 
     // ── transfers
@@ -448,12 +535,19 @@ struct DufsCorePrivate {
         Transfer* t = transfer(id);
         if (!t) return;
         if (t->file) { t->file->close(); delete t->file; t->file = nullptr; }
-        if (t->state == "cancelled") {
-            if (t->kind == "download") { std::error_code ec; fs::remove(t->local, ec); }
-        } else if (r->error() != QNetworkReply::NoError) {
+        const bool cancelled = t->state == "cancelled";
+        const bool failed = !cancelled && r->error() != QNetworkReply::NoError;
+        std::error_code ec;
+        if (t->kind == "download" && (cancelled || failed)) fs::remove(t->local + ".part", ec);
+        if (t->kind == "download" && !cancelled && !failed) {
+            fs::rename(t->local + ".part", t->local, ec);
+            if (ec) { t->state = "failed"; t->error = "Downloaded, but could not save to " + t->local + "."; fs::remove(t->local + ".part", ec); }
+        }
+        if (cancelled || t->state == "failed") {
+            // already final
+        } else if (failed) {
             t->state = "failed";
             t->error = httpError(r);
-            if (t->kind == "download") { std::error_code ec; fs::remove(t->local, ec); }
         } else {
             t->state = "done";
             if (t->total > 0) t->done = t->total;
@@ -480,13 +574,13 @@ struct DufsCorePrivate {
         QNetworkRequest req = request(*s, urlFor(*s, t.path), 120000);
         req.setHeader(QNetworkRequest::ContentLengthHeader, t.total);
         req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
-        QNetworkReply* r = net()->put(req, f);
+        QNetworkReply* r = watch(net()->put(req, f));
         t.reply = r;
         const std::string id = t.id;
-        QObject::connect(r, &QNetworkReply::uploadProgress, [this, id](qint64 sent, qint64 total) {
+        QObject::connect(r, &QNetworkReply::uploadProgress, guarded("upload progress", [this, id](qint64 sent, qint64 total) {
             if (Transfer* x = transfer(id)) { x->done = sent; if (total > 0) x->total = total; changed(); }
-        });
-        QObject::connect(r, &QNetworkReply::finished, [this, id, r] { r->deleteLater(); finishTransfer(id, r, true); });
+        }));
+        QObject::connect(r, &QNetworkReply::finished, guarded("upload", [this, id, r] { r->deleteLater(); finishTransfer(id, r, true); }));
     }
 
     void startDownload(Transfer& t, bool zip)
@@ -494,7 +588,9 @@ struct DufsCorePrivate {
         Server* s = find(t.serverId);
         if (!s) { t.state = "failed"; t.error = "The server was removed."; return; }
         std::error_code ec; fs::create_directories(fs::path(t.local).parent_path(), ec);
-        auto* f = new QFile(QString::fromStdString(t.local));
+        // Write next to the target and rename on success, so a failed or cancelled download never
+        // destroys a file the user chose to replace.
+        auto* f = new QFile(QString::fromStdString(t.local + ".part"));
         if (!f->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             t.state = "failed"; t.error = "Cannot write to " + t.local + "."; delete f; return;
         }
@@ -502,23 +598,46 @@ struct DufsCorePrivate {
         t.state = "running";
         QUrl u = urlFor(*s, t.path);
         if (zip) u.setQuery("zip");
-        QNetworkReply* r = net()->get(request(*s, u, 120000));
+        QNetworkReply* r = watch(net()->get(request(*s, u, 120000)));
         t.reply = r;
         const std::string id = t.id;
-        QObject::connect(r, &QNetworkReply::readyRead, [this, id, r] {
+        QObject::connect(r, &QNetworkReply::readyRead, guarded("download read", [this, id, r] {
             Transfer* x = transfer(id);
             if (!x || !x->file) return;
             if (r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() >= 400) return;
             x->file->write(r->readAll());
-        });
-        QObject::connect(r, &QNetworkReply::downloadProgress, [this, id](qint64 got, qint64 total) {
+        }));
+        QObject::connect(r, &QNetworkReply::downloadProgress, guarded("download progress", [this, id](qint64 got, qint64 total) {
             if (Transfer* x = transfer(id)) { x->done = got; if (total > 0) x->total = total; changed(); }
-        });
-        QObject::connect(r, &QNetworkReply::finished, [this, id, r] { r->deleteLater(); finishTransfer(id, r, false); });
+        }));
+        QObject::connect(r, &QNetworkReply::finished, guarded("download", [this, id, r] { r->deleteLater(); finishTransfer(id, r, false); }));
     }
 
     // ── previews
     std::string cacheDir() const { return viewDir.empty() ? "" : viewDir + "/cache"; }
+    static std::string cachePrefix(const Server& s)
+    {
+        return QCryptographicHash::hash(QByteArray::fromStdString(s.id), QCryptographicHash::Sha1).toHex().left(10).toStdString() + "-";
+    }
+    void purgeCache(const Server& s)
+    {
+        const std::string dir = cacheDir();
+        if (dir.empty()) return;
+        const std::string pre = cachePrefix(s);
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator(dir, ec))
+            if (e.path().filename().string().rfind(pre, 0) == 0) fs::remove(e.path(), ec);
+    }
+    // A NUL byte, or many invalid UTF-8 sequences, in the first 4 KiB means "not text".
+    static bool looksBinary(const QByteArray& b)
+    {
+        const QByteArray head = b.left(4096);
+        if (head.contains('\0')) return true;
+        const QString t = QString::fromUtf8(head);
+        int bad = 0;
+        for (QChar c : t) if (c == QChar::ReplacementCharacter) bad++;
+        return t.size() > 0 && bad * 20 > t.size();
+    }
 
     void pruneCache()
     {
@@ -543,7 +662,7 @@ struct DufsCorePrivate {
 
     const json* entryFor(const std::string& p) const
     {
-        for (auto& e : entries) if (e.value("path", "") == p) return &e;
+        for (auto& e : entries) if (jstr(e, "path", "") == p) return &e;
         return nullptr;
     }
 
@@ -562,15 +681,16 @@ struct DufsCorePrivate {
         const json* e = entryFor(p);
         auto& pv = previews[p];
         if (!s || !e) { pv.state = "error"; pv.error = "Not in this folder any more."; return; }
-        const std::string kind = e->value("kind", "");
+        const std::string kind = jstr(*e, "kind", "");
         const quint64 gen = listGen;
         previewJobs++;
         if (kind == "image") {
             const std::string key = QCryptographicHash::hash(
-                QByteArray::fromStdString(s->url + "|" + p + "|" + std::to_string(e->value("mtime", (int64_t)0))),
+                QByteArray::fromStdString(s->url + "|" + p + "|" + std::to_string(jnum(*e, "mtime", 0))),
                 QCryptographicHash::Sha1).toHex().toStdString();
             const std::string ext = extOf(p);
-            const std::string target = cacheDir() + "/" + key + (ext.empty() ? "" : "." + ext);
+            // Prefixed by the server, so removing a server can delete its cached previews.
+            const std::string target = cacheDir() + "/" + cachePrefix(*s) + key + (ext.empty() ? "" : "." + ext);
             std::error_code ec;
             if (fs::exists(target, ec)) {
                 previewJobs--;
@@ -578,8 +698,8 @@ struct DufsCorePrivate {
                 return;
             }
             fs::create_directories(cacheDir(), ec);
-            QNetworkReply* r = net()->get(request(*s, urlFor(*s, p), 60000));
-            QObject::connect(r, &QNetworkReply::finished, [this, r, p, target, gen] {
+            QNetworkReply* r = watch(net()->get(request(*s, urlFor(*s, p), 60000)));
+            QObject::connect(r, &QNetworkReply::finished, guarded("image preview", [this, r, p, target, gen] {
                 r->deleteLater();
                 previewJobs--;
                 if (gen == listGen) {
@@ -598,20 +718,20 @@ struct DufsCorePrivate {
                 }
                 pumpPreviews();
                 pruneCache();
-            });
+            }));
         } else {
             QNetworkRequest req = request(*s, urlFor(*s, p), 30000);
             // dufs answers 416 when the range runs past the end, so only ask for a range on big files.
-            if (e->value("size", (int64_t)0) > kTextPreviewBytes)
+            if (jnum(*e, "size", 0) > kTextPreviewBytes)
                 req.setRawHeader("Range", "bytes=0-" + QByteArray::number(kTextPreviewBytes - 1));
-            QNetworkReply* r = net()->get(req);
+            QNetworkReply* r = watch(net()->get(req));
             auto buf = std::make_shared<QByteArray>();
-            QObject::connect(r, &QNetworkReply::readyRead, [r, buf] {
+            QObject::connect(r, &QNetworkReply::readyRead, guarded("text preview read", [r, buf] {
                 buf->append(r->readAll());
                 if (buf->size() >= kTextPreviewBytes) r->abort();
-            });
-            const qint64 size = e->value("size", (int64_t)0);
-            QObject::connect(r, &QNetworkReply::finished, [this, r, p, buf, gen, size] {
+            }));
+            const qint64 size = jnum(*e, "size", 0);
+            QObject::connect(r, &QNetworkReply::finished, guarded("text preview", [this, r, p, buf, gen, size] {
                 r->deleteLater();
                 previewJobs--;
                 if (gen == listGen) {
@@ -621,14 +741,17 @@ struct DufsCorePrivate {
                     if (r->error() != QNetworkReply::NoError && !cut) { x.state = "error"; x.error = httpError(r); }
                     else {
                         QByteArray b = buf->left(kTextPreviewBytes);
-                        x.text = QString::fromUtf8(b).toStdString();
-                        x.truncated = cut || size > kTextPreviewBytes;
-                        x.state = "ready";
+                        if (looksBinary(b)) { x.state = "error"; x.error = "This looks like a binary file, so there is no text preview."; }
+                        else {
+                            x.text = QString::fromUtf8(b).toStdString();
+                            x.truncated = cut || size > kTextPreviewBytes;
+                            x.state = "ready";
+                        }
                     }
                     changed();
                 }
                 pumpPreviews();
-            });
+            }));
         }
     }
 };
@@ -637,7 +760,9 @@ struct DufsCorePrivate {
 
 DufsCoreImpl::DufsCoreImpl() : d(new DufsCorePrivate(this))
 {
-    d->load();
+    // A damaged servers.json must never stop the module from loading.
+    try { d->load(); }
+    catch (const std::exception& e) { std::fprintf(stderr, "[dufs_core] load: %s\n", e.what()); d->servers.clear(); d->currentId.clear(); }
 }
 
 DufsCoreImpl::~DufsCoreImpl()
@@ -649,7 +774,7 @@ DufsCoreImpl::~DufsCoreImpl()
 void DufsCoreImpl::onContextReady()
 {
     // No calls to other modules here (Basecamp 0.3 rejects them); just the first listing.
-    QTimer::singleShot(0, [this] { d->list(); });
+    QTimer::singleShot(0, guarded("first listing", [this] { d->list(); }));
 }
 
 std::string DufsCoreImpl::snapshot()
@@ -713,6 +838,7 @@ std::string DufsCoreImpl::editServer(const std::string& id, const std::string& c
 
 std::string DufsCoreImpl::removeServer(const std::string& id)
 {
+    if (Server* gone = d->find(id)) d->purgeCache(*gone);
     auto& v = d->servers;
     const auto before = v.size();
     v.erase(std::remove_if(v.begin(), v.end(), [&](const Server& s) { return s.id == id; }), v.end());

@@ -19,7 +19,7 @@ class Bridge : public QObject {
 public:
   QString ctl;
   Q_INVOKABLE void callModuleAsync(QString mod, QString method, QVariantList args, QJSValue cb, int) {
-    QStringList a{"dufs", "call", mod, method};
+    QStringList a{QString::fromLocal8Bit(qgetenv("SESS").isEmpty() ? "dufs" : qgetenv("SESS")), "call", mod, method};
     for (auto& v : args) a << "str:" + v.toString();
     auto* p = new QProcess(this);
     connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [p, cb](int, QProcess::ExitStatus) mutable {

@@ -2,7 +2,7 @@
   "name": "dufs",
   "display_name": "Dufs",
   "icon": "icon.png",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "ui_qml",
   "category": "tools",
   "description": "Browse, preview, upload and download files on your dufs servers - several servers, one switcher",

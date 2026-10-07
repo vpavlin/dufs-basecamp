@@ -79,6 +79,8 @@ Item {
     property bool gridMode: false
     property var requested: ({})
     property bool dropHover: false
+    // The core answered before and has now gone quiet: it stopped or crashed.
+    readonly property bool coreLost: root.coreSeen && root.missedPolls >= 4
 
     readonly property var servers: st.servers || []
     readonly property var currentServer: {
@@ -181,7 +183,38 @@ Item {
         var r = root.requested; r[e.path] = true; root.requested = r
         act("preview", [e.path])
     }
+    // The file:// URL of a local path; each segment encoded so names with #, ? or % survive.
+    function fileUrl(path) {
+        return "file://" + String(path).split("/").map(function (seg) { return encodeURIComponent(seg) }).join("/")
+    }
+    function askSave(e) {
+        if (!e) return
+        var dir = root.st.downloadsDir || ""
+        var name = e.name + (e.dir ? ".zip" : "")
+        saveDialog.target = e
+        if (dir) saveDialog.currentFolder = root.fileUrl(dir)
+        saveDialog.selectedFile = root.fileUrl((dir ? dir : "") + "/" + name)
+        saveDialog.open()
+    }
+    // A file-picker or drop URL -> its file name.
+    function baseOf(u) {
+        var s = String(u)
+        try { s = decodeURIComponent(s) } catch (e) {}
+        return s.substring(s.lastIndexOf("/") + 1)
+    }
+    // Uploading over an existing name replaces it on the server: ask first.
     function uploadUrls(urls) {
+        var list = []
+        for (var i = 0; i < urls.length; i++) list.push(String(urls[i]))
+        if (!list.length) return
+        var existing = {}
+        var es = root.st.entries || []
+        for (var k = 0; k < es.length; k++) if (!es[k].dir) existing[es[k].name] = true
+        var clashes = list.filter(function (u) { return existing[root.baseOf(u)] })
+        if (clashes.length && !root.st.query) { replaceDialog.ask(list, clashes); return }
+        root.uploadNow(list)
+    }
+    function uploadNow(urls) {
         var list = []
         for (var i = 0; i < urls.length; i++) list.push(String(urls[i]))
         if (!list.length) return
@@ -192,7 +225,8 @@ Item {
 
     // ── formatting
     function fmtSize(n, dir) {
-        if (dir) return n === 1 ? "1 item" : (n || 0) + " items"
+        // dufs caps a folder's count at 1000
+        if (dir) return n === 1 ? "1 item" : (n >= 1000 ? "1000+ items" : (n || 0) + " items")
         if (n === undefined || n === null) return ""
         var u = ["B", "KB", "MB", "GB", "TB"], i = 0, v = n
         while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
@@ -369,12 +403,29 @@ Item {
                         Connections { target: root; function onStChanged() { if (!searchField.activeFocus && (root.st.query || "") === "") searchField.text = "" } }
                     }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: root.gridMode ? "List" : "Grid"; enabled: !!root.currentServer; onClicked: root.gridMode = !root.gridMode }
-                    LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "New folder"; enabled: !!root.currentServer && root.st.perms.upload !== false && !root.st.query; onClicked: nameDialog.ask("New folder", "", function (n) { root.act("makeDir", [n]) }) }
-                    LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Upload"; enabled: !!root.currentServer && root.st.perms.upload !== false && !root.st.query; onClicked: uploadDialog.open() }
+                    LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "New folder"; enabled: !!root.currentServer && !root.st.error && root.st.perms.upload === true && !root.st.query; onClicked: nameDialog.ask("New folder", "", function (n) { root.act("makeDir", [n]) }) }
+                    LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Upload"; enabled: !!root.currentServer && !root.st.error && root.st.perms.upload === true && !root.st.query; onClicked: uploadDialog.open() }
                     LogosButton { Layout.preferredWidth: 44; Layout.preferredHeight: 34; text: "↻"; enabled: !!root.currentServer; onClicked: root.act("refresh", []) }
                 }
             }
             Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: visible ? 40 : 0
+                visible: root.coreLost
+                color: Qt.darker(root.cBad, 1.8)
+                Text {
+                    anchors.fill: parent
+                    anchors.leftMargin: root.sp * 2
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    color: root.cText
+                    font.pixelSize: 13
+                    text: "Dufs Core stopped responding. Restart Basecamp; if it keeps happening, remove the server you added last."
+                }
+            }
 
             // listing + preview
             RowLayout {
@@ -712,7 +763,7 @@ Item {
                             columns: 2
                             columnSpacing: root.sp
                             rowSpacing: root.sp
-                            LogosButton { Layout.fillWidth: true; text: "Download"; onClicked: { saveDialog.target = root.selectedEntry; saveDialog.selectedFile = "file:///" + root.selectedEntry.name; saveDialog.open() } }
+                            LogosButton { Layout.fillWidth: true; text: "Download"; onClicked: { root.askSave(root.selectedEntry) } }
                             LogosButton { Layout.fillWidth: true; text: "Open in browser"; onClicked: Qt.openUrlExternally(root.selectedEntry.url) }
                             LogosButton { Layout.fillWidth: true; text: "Copy link"; onClicked: root.copyText(root.selectedEntry.url) }
                             LogosButton { Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
@@ -807,7 +858,7 @@ Item {
         property var entry: null
         function popupFor(e) { entry = e; popup() }
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Open" : "Preview"; onTriggered: root.activate(entryMenu.entry) }
-        MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Download as .zip" : "Download"; enabled: !(entryMenu.entry && entryMenu.entry.dir) || root.st.perms.archive !== false; onTriggered: { saveDialog.target = entryMenu.entry; saveDialog.selectedFile = "file:///" + entryMenu.entry.name + (entryMenu.entry.dir ? ".zip" : ""); saveDialog.open() } }
+        MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Download as .zip" : "Download"; enabled: !(entryMenu.entry && entryMenu.entry.dir) || root.st.perms.archive !== false; onTriggered: { root.askSave(entryMenu.entry) } }
         MenuItem { text: "Copy link"; onTriggered: root.copyText(entryMenu.entry.url) }
         MenuItem { text: "Open in browser"; onTriggered: Qt.openUrlExternally(entryMenu.entry.url) }
         MenuSeparator {}
@@ -942,6 +993,41 @@ Item {
                 Item { Layout.fillWidth: true }
                 LogosButton { text: "Cancel"; onClicked: confirmDialog.close() }
                 LogosButton { text: "Delete"; onClicked: { var e = confirmDialog.entry; confirmDialog.close(); if (e.path === root.selectedPath) root.selectedPath = ""; root.act("removePath", [e.path]) } }
+            }
+        }
+    }
+
+    Popup {
+        id: replaceDialog
+        property var all: []
+        property var clashes: []
+        function ask(a, c) { all = a; clashes = c; open() }
+        anchors.centerIn: parent
+        width: 520
+        modal: true
+        padding: 20
+        background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
+        contentItem: ColumnLayout {
+            spacing: 10
+            Text {
+                text: replaceDialog.clashes.length === 1 ? "Replace " + root.baseOf(replaceDialog.clashes[0]) + "?" : "Replace " + replaceDialog.clashes.length + " files?"
+                color: root.cText; font.pixelSize: 17; font.bold: true; wrapMode: Text.WrapAnywhere; Layout.fillWidth: true; textFormat: Text.PlainText
+            }
+            Text {
+                text: (replaceDialog.clashes.length === 1 ? "A file with this name" : "Files with these names") + " already exist" + (replaceDialog.clashes.length === 1 ? "s" : "") + " in " + (root.st.path || "/") + ". Uploading replaces " + (replaceDialog.clashes.length === 1 ? "it" : "them") + " on the server."
+                color: root.cSub; font.pixelSize: 13; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                LogosButton { Layout.preferredWidth: 110; text: "Cancel"; onClicked: replaceDialog.close() }
+                Item { Layout.fillWidth: true }
+                LogosButton {
+                    Layout.preferredWidth: 140
+                    visible: replaceDialog.all.length > replaceDialog.clashes.length
+                    text: "Skip existing"
+                    onClicked: { var c = replaceDialog.clashes; var rest = replaceDialog.all.filter(function (u) { return c.indexOf(u) < 0 }); replaceDialog.close(); root.uploadNow(rest) }
+                }
+                LogosButton { Layout.preferredWidth: 110; text: "Replace"; onClicked: { var a = replaceDialog.all; replaceDialog.close(); root.uploadNow(a) } }
             }
         }
     }
