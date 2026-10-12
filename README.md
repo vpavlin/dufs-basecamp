@@ -5,7 +5,7 @@ Browse, preview, upload and download files on your [dufs](https://github.com/sig
 - **Browse** folders as a list (sortable by name, size, date) or as a grid with image thumbnails
 - **Preview** images and text files (first 64 KB) in a side panel; double-click an image for full size
 - **Markdown** files preview rendered (headings, lists, tables, code, links that open in the browser), or as source
-- **HTML** files preview rendered on a white page with Qt rich text: its CSS subset applies (colours, fonts, alignment, margins, tables), but no CSS layout (flex, grid, positioning) and no scripts; images show their alt text and nothing is fetched. Or as source.
+- **HTML** files preview in a real browser engine when Basecamp provides Qt WebView (Linux, macOS): JavaScript off, and a Content-Security-Policy lets the page load only from its own dufs server, so no external scripts, styles, fonts, images, frames or trackers; a clicked link opens in your browser. Without WebView, a rich-text preview (Qt's CSS subset, no layout). Or as source.
 - **Resize** the server list and the preview panel by dragging their edges; double-click an edge for the default width
 - **Upload** by dropping files onto the window, or with the Upload button; progress shows at the bottom
 - **Download** files, or whole folders as a `.zip`

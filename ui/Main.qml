@@ -98,6 +98,59 @@ Item {
         t = t.replace(/\s(background|src|srcset|on[a-z]+)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
         return t
     }
+    // HTML in a real browser engine (Qt WebView), when Basecamp provides one; otherwise the rich-text
+    // preview above. Locked down: JavaScript off, scripts/<base>/meta refresh stripped, and a CSP that
+    // lets the page load only from its own Dufs server: no external scripts, styles, fonts, images,
+    // frames or connections. A clicked link opens in the system browser, never inside the preview.
+    property var webView: null
+    property bool webTried: false
+    property bool webOk: false
+    property string webBase: ""
+    property string webDoc: ""
+    function originOf(u) { return (String(u || "").match(/^https?:\/\/[^\/?#]+/i) || [""])[0] }
+    function webHtml(src, origin) {
+        var t = String(src || "")
+        t = t.replace(/<script\b[\s\S]*?<\/script\s*>/gi, "").replace(/<script\b[^>]*>/gi, "")
+        t = t.replace(/<base\b[^>]*>/gi, "").replace(/<meta\b[^>]*http-equiv\s*=\s*["']?\s*refresh[^>]*>/gi, "")
+        var self = origin ? " " + origin : ""
+        var csp = "default-src 'none'; script-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; "
+            + "connect-src 'none'; form-action 'none'; base-uri 'none'; style-src 'unsafe-inline'" + self + "; img-src data:" + self
+            + "; font-src data:" + self + "; media-src" + (self || " 'none'")
+        var meta = '<meta http-equiv="Content-Security-Policy" content="' + csp + '">'
+        return /<head\b[^>]*>/i.test(t) ? t.replace(/<head\b[^>]*>/i, function (m) { return m + meta }) : meta + t
+    }
+    function ensureWebView(host) {
+        if (webTried) return webOk
+        webTried = true
+        try {
+            webView = Qt.createQmlObject('import QtQuick; import QtWebView; WebView { anchors.fill: parent }', host, "dufsWebView")
+            try {
+                webView.settings.javaScriptEnabled = false
+                webView.settings.localStorageEnabled = false
+                webView.settings.allowFileAccess = false
+                webView.settings.localContentCanAccessFileUrls = false
+            } catch (e) { console.warn("Dufs: WebView settings unavailable: " + e) }
+            webView.loadingChanged.connect(function (req) {
+                var u = String(req.url || "")
+                if (req.status !== 0) return   // WebView.LoadStartedStatus (QtWebView is not imported here)
+                if (!u || u === "about:blank" || u === webBase || u.indexOf(webBase + "#") === 0 || u.indexOf("data:") === 0) return
+                webView.stop()
+                if (/^https?:/i.test(u)) openUrl(u)
+                webView.loadHtml(webDoc, webBase)
+            })
+            webOk = true
+        } catch (e) {
+            console.warn("Dufs: no WebView here, HTML previews use rich text (" + e + ")")
+            webView = null; webOk = false
+        }
+        return webOk
+    }
+    function showWeb(host, body, url) {
+        if (!ensureWebView(host)) return
+        webBase = String(url || ""); webDoc = webHtml(body, originOf(url))
+        webView.loadHtml(webDoc, webBase)
+    }
+
     // Markdown made into the rich text a Text shows. By hand rather than Qt's MarkdownText, which
     // paints links in the application palette's blue (unreadable here) and loads images: a file
     // shows without fetching anything, so images become their alt text and raw HTML shows as text.
@@ -910,7 +963,7 @@ Item {
                                 background: Rectangle { radius: 6; color: textScroll.rendered && textScroll.html ? "#fbfbf9" : "transparent" }
                                 anchors.fill: parent
                                 anchors.margins: 6
-                                visible: !!body
+                                visible: !!body && !webHost.visible
                                 contentWidth: availableWidth
                                 // Two children, so ScrollView can't size its content itself: say how tall it is.
                                 contentHeight: rendered ? mdView.implicitHeight : plainView.implicitHeight
@@ -948,6 +1001,15 @@ Item {
                                     onLinkActivated: (link) => root.openMdLink(link)
                                     HoverHandler { cursorShape: mdView.hoveredLink ? Qt.PointingHandCursor : Qt.ArrowCursor }
                                 }
+                            }
+                            Item {
+                                id: webHost
+                                anchors.fill: parent
+                                anchors.margins: 6
+                                visible: textScroll.html && textScroll.rendered && !!textScroll.body && root.webOk
+                                readonly property string key: textScroll.html && textScroll.rendered && textScroll.body
+                                    ? root.selectedEntry.url + "|" + textScroll.body.length : ""
+                                onKeyChanged: if (key) root.showWeb(webHost, textScroll.body, root.selectedEntry.url)
                             }
                             Column {
                                 anchors.centerIn: parent
