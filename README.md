@@ -8,7 +8,7 @@ Browse, preview, upload and download files on your [dufs](https://github.com/sig
 - **Resize** the server list and the preview panel by dragging their edges; double-click an edge for the default width
 - **Upload** by dropping files onto the window, or with the Upload button; progress shows at the bottom
 - **Download** files, or whole folders as a `.zip`
-- **New folder, rename, delete, search**, copy a file's link, open it in the browser
+- **New folder, rename, delete, search** (Ctrl+F; Esc clears it), copy a file's link, open it in the browser
 - **Logins**: servers started with `--auth` take a user name and password
 
 What a server allows depends on how dufs runs: `dufs -A /data` allows everything (upload, delete, search, archive); without the `--allow-*` flags the buttons are disabled and the view says why.
