@@ -524,7 +524,17 @@ Item {
                         background: Rectangle { radius: 6; color: root.cSurface; border.width: 1; border.color: searchField.activeFocus ? root.cAccent : root.cLine }
                         onAccepted: root.act("search", [text.trim()])
                         // Esc: clear the search and go back to the folder.
-                        Keys.onEscapePressed: { if (text !== "" || root.st.query) { text = ""; root.act("search", [""]) } focus = false }
+                        Keys.onEscapePressed: { clearSearch(); focus = false }
+                        function clearSearch() { if (text !== "" || root.st.query) { text = ""; root.act("search", [""]) } }
+                        rightPadding: clearX.visible ? 28 : leftPadding
+                        // ✕: clear the search, back to the folder.
+                        Text {
+                            id: clearX
+                            visible: searchField.text !== "" || !!root.st.query
+                            anchors.right: parent.right; anchors.rightMargin: 9; anchors.verticalCenter: parent.verticalCenter
+                            text: "✕"; color: clearMouse.containsMouse ? root.cText : root.cSub; font.pixelSize: 13; textFormat: Text.PlainText
+                            MouseArea { id: clearMouse; anchors.fill: parent; anchors.margins: -7; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: searchField.clearSearch() }
+                        }
                         Connections { target: root; function onStChanged() { if (!searchField.activeFocus && (root.st.query || "") === "") searchField.text = "" } }
                     }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: root.gridMode ? "List" : "Grid"; enabled: !!root.currentServer; onClicked: root.gridMode = !root.gridMode }
