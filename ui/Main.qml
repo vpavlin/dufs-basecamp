@@ -81,6 +81,19 @@ Item {
     // Markdown files preview rendered; "source" shows the text as it is.
     property bool mdSource: false
     function isMarkdown(e) { return !!e && !e.dir && /\.(md|markdown|mdown|mkdn?)$/i.test(e.name || "") }
+    function isHtml(e) { return !!e && !e.dir && /\.(html?|xhtml)$/i.test(e.name || "") }
+    // An HTML file, for Qt's rich text (no CSS layout, no scripts): what could run or fetch is taken
+    // out first: scripts, styles, frames, embeds, forms. Images become their alt text, and style
+    // attributes go, since they could load a background image (and pages assume a white page anyway).
+    function htmlForView(src) {
+        var t = String(src || "")
+        t = t.replace(/<!--[\s\S]*?-->/g, "")
+        t = t.replace(/<(script|style|head|iframe|object|embed|noscript|template|svg|math|video|audio|canvas|form|select|textarea|button)\b[\s\S]*?<\/\1\s*>/gi, "")
+        t = t.replace(/<(script|style|iframe|object|embed|link|meta|base|input|source|track|frame|frameset|param)\b[^>]*>/gi, "")
+        t = t.replace(/<img\b[^>]*>/gi, function (m) { var a = m.match(/\balt\s*=\s*("([^"]*)"|'([^']*)')/i); return a ? (a[2] || a[3] || "") : "" })
+        t = t.replace(/\s(style|background|src|srcset|on[a-z]+)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+        return t
+    }
     // Markdown made into the rich text a Text shows. By hand rather than Qt's MarkdownText, which
     // paints links in the application palette's blue (unreadable here) and loads images: a file
     // shows without fetching anything, so images become their alt text and raw HTML shows as text.
@@ -852,7 +865,7 @@ Item {
                             color: root.cFaint; font.pixelSize: 12; textFormat: Text.PlainText
                         }
                         Row {
-                            visible: root.isMarkdown(root.selectedEntry) && !!root.selectedPreview && !!root.selectedPreview.text
+                            visible: (root.isMarkdown(root.selectedEntry) || root.isHtml(root.selectedEntry)) && !!root.selectedPreview && !!root.selectedPreview.text
                             spacing: 14
                             Repeater {
                                 model: [{ label: "Rendered", src: false }, { label: "Source", src: true }]
@@ -887,7 +900,10 @@ Item {
                                 id: textScroll
                                 readonly property string body: root.selectedPreview && root.selectedPreview.text ? root.selectedPreview.text : ""
                                 readonly property bool cut: !!root.selectedPreview && !!root.selectedPreview.truncated
-                                readonly property bool rendered: root.isMarkdown(root.selectedEntry) && !root.mdSource
+                                readonly property bool html: root.isHtml(root.selectedEntry)
+                                readonly property bool rendered: (root.isMarkdown(root.selectedEntry) || html) && !root.mdSource
+                                // HTML shows on a white page, as it was written for one.
+                                background: Rectangle { radius: 6; color: textScroll.rendered && textScroll.html ? "#fbfbf9" : "transparent" }
                                 anchors.fill: parent
                                 anchors.margins: 6
                                 visible: !!body
@@ -919,11 +935,12 @@ Item {
                                     width: textScroll.availableWidth
                                     padding: 6
                                     wrapMode: Text.Wrap
-                                    color: root.cText
-                                    linkColor: root.cAccent
+                                    color: textScroll.html ? "#1d1d1f" : root.cText
+                                    linkColor: textScroll.html ? "#1a5fb4" : root.cAccent
                                     font.pixelSize: 13
                                     textFormat: Text.RichText
-                                    text: !textScroll.rendered || !textScroll.body ? "" : root.mdToHtml(textScroll.body) + (textScroll.cut ? "<hr><p><i>First 64 KB shown</i></p>" : "")
+                                    text: !textScroll.rendered || !textScroll.body ? ""
+                                        : (textScroll.html ? root.htmlForView(textScroll.body) : root.mdToHtml(textScroll.body)) + (textScroll.cut ? "<hr><p><i>First 64 KB shown</i></p>" : "")
                                     onLinkActivated: (link) => root.openMdLink(link)
                                     HoverHandler { cursorShape: mdView.hoveredLink ? Qt.PointingHandCursor : Qt.ArrowCursor }
                                 }
