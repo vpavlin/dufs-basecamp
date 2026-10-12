@@ -22,7 +22,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#include <cstring>
+#include <spawn.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <memory>
 #include <deque>
@@ -1008,4 +1012,61 @@ std::string DufsCoreImpl::preview(const std::string& path)
     if (pv.state == "loading") { d->previewQueue.push_back(path); d->pumpPreviews(); }
     d->changed();
     return d->state().dump();
+}
+
+// ── links ────────────────────────────────────────────────────────────────────
+// Basecamp's sandbox turns a view's Qt.openUrlExternally of a remote address into nothing, so links
+// open here: xdg-open (open on macOS), started without what Basecamp's AppImage puts in its own
+// environment. Its LD_PRELOAD makes the coreutils xdg-open runs refuse to start (the link silently
+// doesn't open), and its library and Qt paths would be handed to programs built against the system's.
+// As foray_core does.
+extern "C" char** environ;
+namespace {
+std::vector<std::string> browserEnv()
+{
+    static const char* drop[] = {"LD_PRELOAD=", "LD_LIBRARY_PATH=", "QT_PLUGIN_PATH=", "QML2_IMPORT_PATH=",
+                                 "QML_IMPORT_PATH=", "APPDIR=", "APPIMAGE=", "ARGV0=", "OWD=", "__BUNDLE_REAL_EXE="};
+    std::vector<std::string> out;
+    for (char** v = environ; v && *v; v++) {
+        bool keep = true;
+        for (const char* d : drop)
+            if (std::strncmp(*v, d, std::strlen(d)) == 0) keep = false;
+        if (keep) out.emplace_back(*v);
+    }
+    return out;
+}
+bool openableUrl(const std::string& url)
+{
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return false;
+    if (url.size() > 4096) return false;
+    for (unsigned char c : url)
+        if (c <= 0x20 || c == 0x7f) return false;
+    return true;
+}
+} // namespace
+
+std::string DufsCoreImpl::openUrl(const std::string& url)
+{
+    if (!openableUrl(url)) return json({{"ok", false}, {"error", "Only http and https links open."}}).dump();
+#ifdef __APPLE__
+    std::string bin = "open";
+#else
+    std::string bin = "xdg-open";
+#endif
+    auto env = browserEnv();
+    std::vector<char*> envp;
+    for (auto& v : env) envp.push_back(const_cast<char*>(v.c_str()));
+    envp.push_back(nullptr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    char* argv[] = {const_cast<char*>(bin.c_str()), const_cast<char*>(url.c_str()), nullptr};
+    pid_t pid;
+    int rc = posix_spawnp(&pid, argv[0], &fa, nullptr, argv, envp.data());
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) return json({{"ok", false}, {"error", bin + ": " + std::strerror(rc)}}).dump();
+    // It hands the link to the browser and exits; reaped so it is no zombie.
+    std::thread([pid]() { ::waitpid(pid, nullptr, 0); }).detach();
+    return json({{"ok", true}}).dump();
 }

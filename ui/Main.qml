@@ -161,12 +161,22 @@ Item {
     // A link in a rendered file: http(s) opens in the browser; a relative one is resolved against the file's own URL.
     function openMdLink(link) {
         var l = String(link || "")
-        if (/^https?:\/\//i.test(l)) { Qt.openUrlExternally(l); return }
+        if (/^https?:\/\//i.test(l)) { openUrl(l); return }
         if (!l || l.charAt(0) === "#" || /^[a-z][a-z0-9+.-]*:/i.test(l) || !selectedEntry) return
         var base = String(selectedEntry.url || "")
         var origin = (base.match(/^https?:\/\/[^\/]+/i) || [""])[0]
         if (!origin) return
-        Qt.openUrlExternally(l.charAt(0) === "/" ? origin + l : base.replace(/[^\/]*$/, "") + l)
+        openUrl(l.charAt(0) === "/" ? origin + l : base.replace(/[^\/]*$/, "") + l)
+    }
+    // The browser is opened by dufs_core: Basecamp's sandbox ignores a view's Qt.openUrlExternally.
+    // If the core can't (an older core, no xdg-open), the link is copied instead.
+    function openUrl(u) {
+        callVia(coreName, "openUrl", [u], function (raw) {
+            var o = parse(raw)
+            if (o && o.ok === true) return
+            copyText(u)
+            toast("Couldn't open a browser, so the link is copied" + (o && o.error ? " (" + o.error + ")" : ""), true)
+        })
     }
     property string sortBy: "name"
     property bool sortDesc: false
@@ -943,7 +953,7 @@ Item {
                             columnSpacing: root.sp
                             rowSpacing: root.sp
                             LogosButton { Layout.fillWidth: true; text: "Download"; onClicked: { root.askSave(root.selectedEntry) } }
-                            LogosButton { Layout.fillWidth: true; text: "Open in browser"; onClicked: Qt.openUrlExternally(root.selectedEntry.url) }
+                            LogosButton { Layout.fillWidth: true; text: "Open in browser"; onClicked: root.openUrl(root.selectedEntry.url) }
                             LogosButton { Layout.fillWidth: true; text: "Copy link"; onClicked: root.copyText(root.selectedEntry.url) }
                             LogosButton { Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
                             LogosButton { Layout.fillWidth: true; Layout.columnSpan: 2; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
@@ -1039,7 +1049,7 @@ Item {
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Open" : "Preview"; onTriggered: root.activate(entryMenu.entry) }
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Download as .zip" : "Download"; enabled: !(entryMenu.entry && entryMenu.entry.dir) || root.st.perms.archive !== false; onTriggered: { root.askSave(entryMenu.entry) } }
         MenuItem { text: "Copy link"; onTriggered: root.copyText(entryMenu.entry.url) }
-        MenuItem { text: "Open in browser"; onTriggered: Qt.openUrlExternally(entryMenu.entry.url) }
+        MenuItem { text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
         MenuSeparator {}
         MenuItem { text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }
         MenuItem { text: "Delete"; enabled: root.st.perms.delete !== false; onTriggered: confirmDialog.ask(entryMenu.entry) }

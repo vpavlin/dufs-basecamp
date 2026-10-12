@@ -63,6 +63,9 @@ public:
     // Image: fetched into the view's cache dir. Text: the first 64 KiB inline.
     std::string preview(const std::string& path);
 
+    // Opens an http(s) link in the system browser (the sandboxed view's Qt.openUrlExternally can't).
+    std::string openUrl(const std::string& url);
+
     void onContextReady() override;
 
 logos_events:
