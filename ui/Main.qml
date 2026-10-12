@@ -872,8 +872,14 @@ Item {
                                 anchors.margins: 6
                                 visible: !!body
                                 contentWidth: availableWidth
+                                // Two children, so ScrollView can't size its content itself: say how tall it is.
+                                contentHeight: rendered ? mdView.implicitHeight : plainView.implicitHeight
+                                // Another file, or the other view: from the top.
+                                onBodyChanged: contentItem.contentY = 0
+                                onRenderedChanged: contentItem.contentY = 0
                                 // As written: selectable, monospace.
                                 TextArea {
+                                    id: plainView
                                     visible: !textScroll.rendered
                                     width: textScroll.availableWidth
                                     readOnly: true
