@@ -331,20 +331,33 @@ Item {
         if (intent !== "dufs.open") { intentReply(requestId, false, "bad_request"); return }
         // Before the first snapshot the server list is unknown: answer once it arrives.
         if (!root.coreSeen) { var q = root.pendingIntents.slice(); q.push([requestId, intent, p]); root.pendingIntents = q; return }
-        var u = String(p.url || "").trim().replace(/[?#].*$/, "")
+        intentReply(requestId, openAddress(p.url) ? true : false, "bad_request")
+    }
+    // Opens a file or folder by its address: http(s) on a server Dufs knows, or a
+    // basecamp://intent/dufs.open?p=… link. Says why in a toast when it can't; true when it opened.
+    function openAddress(addr) {
+        var u = String(addr || "").trim()
+        var m = u.match(/^basecamp:\/\/intent\/dufs\.open\/?\?(?:.*&)?p=([A-Za-z0-9_\-=%]+)/i)
+        if (m) {
+            try {
+                var b = decodeURIComponent(m[1]).replace(/-/g, "+").replace(/_/g, "/")
+                while (b.length % 4) b += "="
+                u = String(JSON.parse(decodeURIComponent(escape(Qt.atob(b)))).url || "").trim()
+            } catch (e) { toast("That Basecamp link doesn't hold a Dufs address.", true); return false }
+        }
+        u = u.replace(/[?#].*$/, "")
+        if (!/^https?:\/\//i.test(u)) { toast("Paste an http(s) address on a dufs server, or a Basecamp link from Dufs.", true); return false }
         var hit = null, best = -1
         var servers = root.st.servers || []
         for (var i = 0; i < servers.length; i++) {
-            var b = String(servers[i].url || "").replace(/\/+$/, "")
-            if (!b) continue
-            var lu = u.toLowerCase(), lb = b.toLowerCase()
-            if ((lu === lb || lu.indexOf(lb + "/") === 0) && b.length > best) { hit = servers[i]; best = b.length }
+            var sb = String(servers[i].url || "").replace(/\/+$/, "")
+            if (!sb) continue
+            var lu = u.toLowerCase(), lb = sb.toLowerCase()
+            if ((lu === lb || lu.indexOf(lb + "/") === 0) && sb.length > best) { hit = servers[i]; best = sb.length }
         }
-        if (!/^https?:\/\//i.test(u)) { toast("Dufs can only open http(s) addresses.", true); intentReply(requestId, false, "bad_request"); return }
         if (!hit) {
-            toast("Dufs has no server at " + (u.match(/^https?:\/\/[^\/]+/i) || [u])[0] + ". Add it, then open the link again.", true)
-            intentReply(requestId, false, "bad_request")
-            return
+            toast("Dufs has no server at " + (u.match(/^https?:\/\/[^\/]+/i) || [u])[0] + ". Add it, then open the address again.", true)
+            return false
         }
         var path
         try { path = decodeURIComponent(u.substring(best)) } catch (e) { path = u.substring(best) }
@@ -356,7 +369,7 @@ Item {
         var open = function () { callVia(coreName, "openDir", [dir], function (raw) { apply(parse(raw)) }) }
         if (root.st.current !== hit.id) callVia(coreName, "selectServer", [hit.id], function (raw) { apply(parse(raw)); open() })
         else open()
-        intentReply(requestId, true)
+        return true
     }
     // After a dufs.open: select the file once its folder's listing is in.
     function selectPending() {
@@ -517,6 +530,16 @@ Item {
     Component.onCompleted: { registerViewDir(); refresh() }
 
     TextEdit { id: clip; visible: false }
+    // Ctrl+L: the address bar, holding this folder's address, selected to paste over.
+    property bool addrEditing: false
+    function startAddress() {
+        if (!root.currentServer) return
+        root.addrEditing = true
+        var cur = String(root.currentServer.url || "").replace(/\/+$/, "") + encodeURI(root.st.path || "/")
+        addrField.text = cur
+        addrField.forceActiveFocus(); addrField.selectAll()
+    }
+    Shortcut { sequence: "Ctrl+L"; onActivated: root.startAddress() }
     // Ctrl+F (Cmd+F on a Mac): to the search box, its text selected to type over.
     Shortcut {
         sequence: StandardKey.Find
@@ -623,8 +646,26 @@ Item {
                     anchors.leftMargin: root.sp * 2
                     anchors.rightMargin: root.sp * 2
                     spacing: root.sp
+                    // Go to an address: paste a file's http(s) address or a Basecamp link from Dufs.
+                    TextField {
+                        id: addrField
+                        visible: root.addrEditing
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 160
+                        Layout.preferredHeight: 34
+                        placeholderText: "Paste a dufs address or a Basecamp link from Dufs, then Enter"
+                        color: root.cText
+                        placeholderTextColor: root.cFaint
+                        font.pixelSize: 13
+                        selectByMouse: true
+                        background: Rectangle { radius: 6; color: root.cSurface; border.width: 1; border.color: addrField.activeFocus ? root.cAccent : root.cLine }
+                        onAccepted: { if (root.openAddress(text)) root.addrEditing = false }
+                        Keys.onEscapePressed: root.addrEditing = false
+                        onActiveFocusChanged: if (!activeFocus) root.addrEditing = false
+                    }
                     // breadcrumb
                     Flickable {
+                        visible: !root.addrEditing
                         Layout.fillWidth: true
                         Layout.minimumWidth: 160
                         Layout.preferredHeight: 32
@@ -687,6 +728,7 @@ Item {
                         }
                         Connections { target: root; function onStChanged() { if (!searchField.activeFocus && (root.st.query || "") === "") searchField.text = "" } }
                     }
+                    LogosButton { Layout.preferredWidth: 80; Layout.preferredHeight: 34; text: "Go to…"; enabled: !!root.currentServer; onClicked: root.startAddress() }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: root.gridMode ? "List" : "Grid"; enabled: !!root.currentServer; onClicked: root.gridMode = !root.gridMode }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "New folder"; enabled: !!root.currentServer && !root.st.error && root.st.perms.upload === true && !root.st.query; onClicked: nameDialog.ask("New folder", "", function (n) { root.act("makeDir", [n]) }) }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Upload"; enabled: !!root.currentServer && !root.st.error && root.st.perms.upload === true && !root.st.query; onClicked: uploadDialog.open() }
