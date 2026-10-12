@@ -82,16 +82,20 @@ Item {
     property bool mdSource: false
     function isMarkdown(e) { return !!e && !e.dir && /\.(md|markdown|mdown|mkdn?)$/i.test(e.name || "") }
     function isHtml(e) { return !!e && !e.dir && /\.(html?|xhtml)$/i.test(e.name || "") }
-    // An HTML file, for Qt's rich text (no CSS layout, no scripts): what could run or fetch is taken
-    // out first: scripts, styles, frames, embeds, forms. Images become their alt text, and style
-    // attributes go, since they could load a background image (and pages assume a white page anyway).
+    // An HTML file, for Qt's rich text: Qt's CSS subset (colours, fonts, alignment, margins, simple
+    // backgrounds, tables), no CSS layout, no scripts. What could run or fetch is taken out first:
+    // scripts, frames, embeds, forms, linked stylesheets, and in CSS every url() and @import. Images
+    // become their alt text. Shown on a white page, as most pages assume one.
     function htmlForView(src) {
+        function css(c) { return String(c).replace(/@import[^;]*;?/gi, "").replace(/url\s*\([^)]*\)/gi, "none").replace(/expression\s*\(/gi, "(") }
         var t = String(src || "")
         t = t.replace(/<!--[\s\S]*?-->/g, "")
-        t = t.replace(/<(script|style|head|iframe|object|embed|noscript|template|svg|math|video|audio|canvas|form|select|textarea|button)\b[\s\S]*?<\/\1\s*>/gi, "")
-        t = t.replace(/<(script|style|iframe|object|embed|link|meta|base|input|source|track|frame|frameset|param)\b[^>]*>/gi, "")
+        t = t.replace(/<(script|iframe|object|embed|noscript|template|svg|math|video|audio|canvas|form|select|textarea|button)\b[\s\S]*?<\/\1\s*>/gi, "")
+        t = t.replace(/<(script|iframe|object|embed|link|meta|base|input|source|track|frame|frameset|param)\b[^>]*>/gi, "")
         t = t.replace(/<img\b[^>]*>/gi, function (m) { var a = m.match(/\balt\s*=\s*("([^"]*)"|'([^']*)')/i); return a ? (a[2] || a[3] || "") : "" })
-        t = t.replace(/\s(style|background|src|srcset|on[a-z]+)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+        t = t.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)/gi, function (m, o, c, e) { return o + css(c) + e })
+        t = t.replace(/\sstyle\s*=\s*("([^"]*)"|'([^']*)')/gi, function (m, q, d, s1) { return ' style="' + css(d !== undefined ? d : s1).replace(/"/g, "'") + '"' })
+        t = t.replace(/\s(background|src|srcset|on[a-z]+)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
         return t
     }
     // Markdown made into the rich text a Text shows. By hand rather than Qt's MarkdownText, which
