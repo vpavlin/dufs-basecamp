@@ -304,7 +304,77 @@ Item {
             root.lastNoticeAt = obj.noticeAt
         } else if (root.lastNoticeAt === 0) root.lastNoticeAt = obj.noticeAt || 1
         if (!obj.previewCache) registerViewDir()
+        if (root.pendingIntents.length) {
+            var q = root.pendingIntents; root.pendingIntents = []
+            for (var i = 0; i < q.length; i++) handleIntent(q[i][0], q[i][1], q[i][2])
+        }
+        selectPending()
     }
+    // ── app-to-app intents: dufs.open {url} (Basecamp's intent broker, metadata.json "provides") ──
+    // Another app, or a basecamp://intent/dufs.open?p=… link (`"web": true`), asks Dufs to show a file
+    // or folder by its address. Dufs finds the server it is on, opens the folder and selects the
+    // file. Every request is answered exactly once through logos.respond.
+    property var pendingIntents: []
+    property string pendingSelect: ""
+    Connections {
+        target: (typeof logos !== "undefined") ? logos : null
+        ignoreUnknownSignals: true
+        function onIntentRequested(requestId, intent, params, requesterName) {
+            root.handleIntent(requestId, intent, params || ({}))
+        }
+    }
+    function intentReply(requestId, ok, error) {
+        try { logos.respond(requestId, ok, ({}), ok ? "" : (error || "failed")) }
+        catch (e) { console.warn("dufs view: respond threw: " + e) }
+    }
+    function handleIntent(requestId, intent, p) {
+        if (intent !== "dufs.open") { intentReply(requestId, false, "bad_request"); return }
+        // Before the first snapshot the server list is unknown: answer once it arrives.
+        if (!root.coreSeen) { var q = root.pendingIntents.slice(); q.push([requestId, intent, p]); root.pendingIntents = q; return }
+        var u = String(p.url || "").trim().replace(/[?#].*$/, "")
+        var hit = null, best = -1
+        var servers = root.st.servers || []
+        for (var i = 0; i < servers.length; i++) {
+            var b = String(servers[i].url || "").replace(/\/+$/, "")
+            if (!b) continue
+            var lu = u.toLowerCase(), lb = b.toLowerCase()
+            if ((lu === lb || lu.indexOf(lb + "/") === 0) && b.length > best) { hit = servers[i]; best = b.length }
+        }
+        if (!/^https?:\/\//i.test(u)) { toast("Dufs can only open http(s) addresses.", true); intentReply(requestId, false, "bad_request"); return }
+        if (!hit) {
+            toast("Dufs has no server at " + (u.match(/^https?:\/\/[^\/]+/i) || [u])[0] + ". Add it, then open the link again.", true)
+            intentReply(requestId, false, "bad_request")
+            return
+        }
+        var path
+        try { path = decodeURIComponent(u.substring(best)) } catch (e) { path = u.substring(best) }
+        if (!path || path.charAt(0) !== "/") path = "/" + path
+        var isDir = /\/$/.test(path)
+        var dir = isDir ? path : path.substring(0, path.lastIndexOf("/") + 1)
+        root.selectedPath = ""; root.requested = ({})
+        root.pendingSelect = isDir ? "" : path
+        var open = function () { callVia(coreName, "openDir", [dir], function (raw) { apply(parse(raw)) }) }
+        if (root.st.current !== hit.id) callVia(coreName, "selectServer", [hit.id], function (raw) { apply(parse(raw)); open() })
+        else open()
+        intentReply(requestId, true)
+    }
+    // After a dufs.open: select the file once its folder's listing is in.
+    function selectPending() {
+        if (!root.pendingSelect || root.st.loading) return
+        var e = root.st.entries || []
+        for (var i = 0; i < e.length; i++) if (e[i].path === root.pendingSelect) {
+            root.pendingSelect = ""
+            root.activate(e[i])
+            return
+        }
+    }
+    // A link that opens this file or folder in Dufs, from another app, a note or a browser:
+    // basecamp://intent/dufs.open?p=<base64url of {"url": …}>.
+    function basecampLink(url) {
+        var b = Qt.btoa(unescape(encodeURIComponent(JSON.stringify({ url: String(url || "") }))))
+        return "basecamp://intent/dufs.open?p=" + b.replace(/\+/g, "-").replace(/\//g, "_")
+    }
+
     function refresh() {
         if (root.busy) { root.again = true; return }
         root.busy = true
@@ -1038,8 +1108,9 @@ Item {
                             LogosButton { Layout.fillWidth: true; text: "Download"; onClicked: { root.askSave(root.selectedEntry) } }
                             LogosButton { Layout.fillWidth: true; text: "Open in browser"; onClicked: root.openUrl(root.selectedEntry.url) }
                             LogosButton { Layout.fillWidth: true; text: "Copy link"; onClicked: root.copyText(root.selectedEntry.url) }
+                            LogosButton { Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
                             LogosButton { Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
-                            LogosButton { Layout.fillWidth: true; Layout.columnSpan: 2; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
+                            LogosButton { Layout.fillWidth: true; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
                         }
                     }
                 }
@@ -1132,6 +1203,7 @@ Item {
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Open" : "Preview"; onTriggered: root.activate(entryMenu.entry) }
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Download as .zip" : "Download"; enabled: !(entryMenu.entry && entryMenu.entry.dir) || root.st.perms.archive !== false; onTriggered: { root.askSave(entryMenu.entry) } }
         MenuItem { text: "Copy link"; onTriggered: root.copyText(entryMenu.entry.url) }
+        MenuItem { text: "Copy Basecamp link"; onTriggered: root.copyText(root.basecampLink(entryMenu.entry.url)) }
         MenuItem { text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
         MenuSeparator {}
         MenuItem { text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }

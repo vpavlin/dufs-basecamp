@@ -10,6 +10,7 @@ Browse, preview, upload and download files on your [dufs](https://github.com/sig
 - **Upload** by dropping files onto the window, or with the Upload button; progress shows at the bottom
 - **Download** files, or whole folders as a `.zip`
 - **New folder, rename, delete, search** (Ctrl+F; the ✕ or Esc clears it), copy a file's link, open it in the browser
+- **Links into Dufs**: "Copy Basecamp link" gives `basecamp://intent/dufs.open?p=…`, which opens that file (or folder) in Dufs from another app, a note or a browser. Other apps can also ask for it directly with the `dufs.open` intent, `{ "url": "http://pi5.lan:5000/docs/notes.md" }`; the server must be one you added to Dufs.
 - **Logins**: servers started with `--auth` take a user name and password
 
 What a server allows depends on how dufs runs: `dufs -A /data` allows everything (upload, delete, search, archive); without the `--allow-*` flags the buttons are disabled and the view says why.

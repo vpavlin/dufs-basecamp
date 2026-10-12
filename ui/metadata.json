@@ -2,7 +2,7 @@
   "name": "dufs",
   "display_name": "Dufs",
   "icon": "icon.png",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "type": "ui_qml",
   "category": "tools",
   "description": "Browse, preview, upload and download files on your dufs servers - several servers, one switcher",
@@ -22,5 +22,21 @@
       "extra_include_dirs": [],
       "extra_link_libraries": []
     }
-  }
+  },
+  "provides": [
+    {
+      "intent": "dufs.open",
+      "web": true,
+      "readOnly": true,
+      "description": "Open a file or folder on one of your dufs servers in Dufs: its folder, with the file selected and previewed.",
+      "params": [
+        {
+          "name": "url",
+          "type": "string",
+          "required": true,
+          "description": "The file's or folder's address on a dufs server Dufs knows, e.g. http://pi5.lan:5000/docs/notes.md (a folder ends with /)."
+        }
+      ]
+    }
+  ]
 }
