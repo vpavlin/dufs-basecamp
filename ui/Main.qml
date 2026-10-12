@@ -74,6 +74,100 @@ Item {
     property bool again: false
     property double lastNoticeAt: 0
     property string selectedPath: ""
+    // Pane widths, set by dragging the dividers (double-click one for its default).
+    property real sideW: 220
+    property real previewW: 340
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
+    // Markdown files preview rendered; "source" shows the text as it is.
+    property bool mdSource: false
+    function isMarkdown(e) { return !!e && !e.dir && /\.(md|markdown|mdown|mkdn?)$/i.test(e.name || "") }
+    // Markdown made into the rich text a Text shows. By hand rather than Qt's MarkdownText, which
+    // paints links in the application palette's blue (unreadable here) and loads images: a file
+    // shows without fetching anything, so images become their alt text and raw HTML shows as text.
+    // CommonMark's common parts plus GitHub tables and ~~strike~~.
+    function mdToHtml(src) {
+        var link = root.cAccent, faint = root.cFaint, raised = root.cRaised, line = root.cLine
+        function esc(t) { return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;") }
+        function a(href, label) { return '<a href="' + href + '"><span style="color:' + link + '">' + label + '</span></a>' }
+        function inline(t) {
+            var keep = []
+            function stash(h) { keep.push(h); return "\u0000" + (keep.length - 1) + "\u0000" }
+            t = t.replace(/`([^`]+)`/g, function (m, c) { return stash('<code style="background-color:' + raised + '">&nbsp;' + esc(c) + '&nbsp;</code>') })
+            t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, function (m, alt) { return stash(esc(alt)) })
+            t = t.replace(/\[([^\]]+)\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)/g, function (m, label, href) { return stash(a(esc(href), esc(label))) })
+            t = t.replace(/<(https?:\/\/[^\s>]+)>/g, function (m, href) { return stash(a(esc(href), esc(href))) })
+            t = t.replace(/(^|[\s(])(https?:\/\/[^\s<)]*[^\s<).,;:!?])/g, function (m, pre, href) { return pre + stash(a(esc(href), esc(href))) })
+            t = esc(t)
+            t = t.replace(/\*\*(\S(?:[^*]*\S)?)\*\*/g, "<b>$1</b>").replace(/__(\S(?:[^_]*\S)?)__/g, "<b>$1</b>")
+            t = t.replace(/(^|[^\w*])\*(\S(?:[^*]*\S)?)\*/g, "$1<i>$2</i>").replace(/(^|[^\w])_(\S(?:[^_]*\S)?)_(?!\w)/g, "$1<i>$2</i>")
+            t = t.replace(/~~(\S(?:[^~]*\S)?)~~/g, "<s>$1</s>")
+            return t.replace(/\u0000(\d+)\u0000/g, function (m, i) { return keep[+i] })
+        }
+        function cells(l) { return l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(function (c) { return c.trim() }) }
+        var lines = String(src || "").replace(/\r/g, "").split("\n"), out = [], para = [], list = null
+        function flush() { if (para.length) { out.push("<p>" + para.map(inline).join("<br>") + "</p>"); para = [] } }
+        function closeList() { if (list) { out.push("</" + list + ">"); list = null } }
+        for (var i = 0; i < lines.length; i++) {
+            var l = lines[i], m
+            if ((m = l.match(/^\s{0,3}(```|~~~)/))) {
+                flush(); closeList()
+                var code = []
+                for (i++; i < lines.length && lines[i].trim().indexOf(m[1]) !== 0; i++) code.push(lines[i])
+                out.push('<table width="100%" cellpadding="8" style="background-color:' + raised + '"><tr><td><pre>' + esc(code.join("\n")) + "</pre></td></tr></table>")
+                continue
+            }
+            if (/^\s*$/.test(l)) { flush(); closeList(); continue }
+            if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(l)) { flush(); closeList(); out.push("<hr>"); continue }
+            if ((m = l.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/))) {
+                flush(); closeList()
+                var n = Math.min(m[1].length, 4)
+                out.push("<h" + n + ">" + inline(m[2]) + "</h" + n + ">")
+                continue
+            }
+            if (/^\s*>/.test(l)) {
+                flush(); closeList()
+                var q = []
+                for (; i < lines.length && /^\s*>/.test(lines[i]); i++) q.push(lines[i].replace(/^\s*>\s?/, ""))
+                i--
+                out.push('<table cellpadding="6"><tr><td style="color:' + faint + '">' + q.map(inline).join("<br>") + "</td></tr></table>")
+                continue
+            }
+            if (/^\s*\|/.test(l) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+                flush(); closeList()
+                var t = '<table cellspacing="0" cellpadding="6" border="1" style="border-color:' + line + '; border-style:solid">'
+                t += "<tr>" + cells(l).map(function (c) { return "<th>" + inline(c) + "</th>" }).join("") + "</tr>"
+                for (i += 2; i < lines.length && /^\s*\|/.test(lines[i]); i++)
+                    t += "<tr>" + cells(lines[i]).map(function (c) { return "<td>" + inline(c) + "</td>" }).join("") + "</tr>"
+                i--
+                out.push(t + "</table>")
+                continue
+            }
+            if ((m = l.match(/^\s*[-*+]\s+(.*)$/)) || (m = l.match(/^\s*\d+[.)]\s+(.*)$/))) {
+                var kind = /^\s*\d/.test(l) ? "ol" : "ul"
+                flush()
+                if (list !== kind) { closeList(); out.push("<" + kind + ">"); list = kind }
+                out.push("<li>" + inline(m[1].replace(/^\[ \]\s+/, "☐ ").replace(/^\[[xX]\]\s+/, "☑ ")) + "</li>")
+                continue
+            }
+            if (list && /^\s{2,}\S/.test(l) && /<\/li>$/.test(out[out.length - 1])) {
+                out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, "<br>" + inline(l.trim()) + "</li>")
+                continue
+            }
+            closeList(); para.push(l)
+        }
+        flush(); closeList()
+        return out.join("\n")
+    }
+    // A link in a rendered file: http(s) opens in the browser; a relative one is resolved against the file's own URL.
+    function openMdLink(link) {
+        var l = String(link || "")
+        if (/^https?:\/\//i.test(l)) { Qt.openUrlExternally(l); return }
+        if (!l || l.charAt(0) === "#" || /^[a-z][a-z0-9+.-]*:/i.test(l) || !selectedEntry) return
+        var base = String(selectedEntry.url || "")
+        var origin = (base.match(/^https?:\/\/[^\/]+/i) || [""])[0]
+        if (!origin) return
+        Qt.openUrlExternally(l.charAt(0) === "/" ? origin + l : base.replace(/[^\/]*$/, "") + l)
+    }
     property string sortBy: "name"
     property bool sortDesc: false
     property bool gridMode: false
@@ -274,6 +368,29 @@ Item {
 
     TextEdit { id: clip; visible: false }
 
+    // A pane divider: a hairline with a wider grab area; drag to resize, double-click for the default.
+    component Divider: Item {
+        id: dv
+        property real startW: 0
+        signal dragged(real dx)
+        signal pressedAt()
+        signal reset()
+        Layout.fillHeight: true
+        Layout.preferredWidth: 1
+        z: 10
+        Rectangle { anchors.fill: parent; color: grab.pressed || grab.containsMouse ? root.cAccent : root.cLine }
+        MouseArea {
+            id: grab
+            property real x0: 0
+            anchors.fill: parent; anchors.leftMargin: -4; anchors.rightMargin: -4
+            hoverEnabled: true
+            cursorShape: Qt.SplitHCursor
+            onPressed: (m) => { x0 = mapToItem(root, m.x, 0).x; dv.pressedAt() }
+            onPositionChanged: (m) => { if (pressed) dv.dragged(mapToItem(root, m.x, 0).x - x0) }
+            onDoubleClicked: dv.reset()
+        }
+    }
+
     // ── layout
     Rectangle { anchors.fill: parent; color: root.cBg }
 
@@ -284,7 +401,7 @@ Item {
         // Servers
         Rectangle {
             Layout.fillHeight: true
-            Layout.preferredWidth: 220
+            Layout.preferredWidth: root.sideW
             color: root.cSurface
             ColumnLayout {
                 anchors.fill: parent
@@ -332,7 +449,7 @@ Item {
                 LogosButton { text: "+ Add server"; Layout.fillWidth: true; onClicked: serverDialog.openFor(null) }
             }
         }
-        Rectangle { Layout.fillHeight: true; Layout.preferredWidth: 1; color: root.cLine }
+        Divider { onDragged: (dx) => root.sideW = root.clamp(startW + dx, 160, Math.min(440, root.width - 520)); onPressedAt: startW = root.sideW; onReset: root.sideW = 220 }
 
         // Browser
         ColumnLayout {
@@ -687,11 +804,11 @@ Item {
                 }
 
                 // preview pane
-                Rectangle { visible: !!root.selectedEntry; Layout.fillHeight: true; Layout.preferredWidth: 1; color: root.cLine }
+                Divider { visible: !!root.selectedEntry; onDragged: (dx) => root.previewW = root.clamp(startW - dx, 260, root.width - root.sideW - 300); onPressedAt: startW = root.previewW; onReset: root.previewW = 340 }
                 Rectangle {
                     visible: !!root.selectedEntry
                     Layout.fillHeight: true
-                    Layout.preferredWidth: 340
+                    Layout.preferredWidth: Math.min(root.previewW, Math.max(260, root.width - root.sideW - 300))
                     color: root.cSurface
                     ColumnLayout {
                         anchors.fill: parent
@@ -705,6 +822,20 @@ Item {
                         Text {
                             text: root.selectedEntry ? root.fmtSize(root.selectedEntry.size, false) + "  ·  " + root.fmtDate(root.selectedEntry.mtime) : ""
                             color: root.cFaint; font.pixelSize: 12; textFormat: Text.PlainText
+                        }
+                        Row {
+                            visible: root.isMarkdown(root.selectedEntry) && !!root.selectedPreview && !!root.selectedPreview.text
+                            spacing: 14
+                            Repeater {
+                                model: [{ label: "Rendered", src: false }, { label: "Source", src: true }]
+                                Text {
+                                    required property var modelData
+                                    text: modelData.label; textFormat: Text.PlainText; font.pixelSize: 12
+                                    color: root.mdSource === modelData.src ? root.cAccent : root.cSub
+                                    font.bold: root.mdSource === modelData.src
+                                    MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor; onClicked: root.mdSource = modelData.src }
+                                }
+                            }
                         }
                         // preview body
                         Rectangle {
@@ -725,10 +856,18 @@ Item {
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: viewer.show(root.selectedEntry) }
                             }
                             ScrollView {
+                                id: textScroll
+                                readonly property string body: root.selectedPreview && root.selectedPreview.text ? root.selectedPreview.text : ""
+                                readonly property bool cut: !!root.selectedPreview && !!root.selectedPreview.truncated
+                                readonly property bool rendered: root.isMarkdown(root.selectedEntry) && !root.mdSource
                                 anchors.fill: parent
                                 anchors.margins: 6
-                                visible: !!root.selectedPreview && !!root.selectedPreview.text
+                                visible: !!body
+                                contentWidth: availableWidth
+                                // As written: selectable, monospace.
                                 TextArea {
+                                    visible: !textScroll.rendered
+                                    width: textScroll.availableWidth
                                     readOnly: true
                                     selectByMouse: true
                                     wrapMode: TextArea.Wrap
@@ -736,7 +875,23 @@ Item {
                                     font.family: "monospace"
                                     font.pixelSize: 12
                                     background: null
-                                    text: root.selectedPreview && root.selectedPreview.text ? root.selectedPreview.text + (root.selectedPreview.truncated ? "\n\n[first 64 KB shown]" : "") : ""
+                                    textFormat: TextEdit.PlainText
+                                    text: textScroll.rendered || !textScroll.body ? "" : textScroll.body + (textScroll.cut ? "\n\n[first 64 KB shown]" : "")
+                                }
+                                // Markdown, rendered (Source has the text to select and copy).
+                                Text {
+                                    id: mdView
+                                    visible: textScroll.rendered
+                                    width: textScroll.availableWidth
+                                    padding: 6
+                                    wrapMode: Text.Wrap
+                                    color: root.cText
+                                    linkColor: root.cAccent
+                                    font.pixelSize: 13
+                                    textFormat: Text.RichText
+                                    text: !textScroll.rendered || !textScroll.body ? "" : root.mdToHtml(textScroll.body) + (textScroll.cut ? "<hr><p><i>First 64 KB shown</i></p>" : "")
+                                    onLinkActivated: (link) => root.openMdLink(link)
+                                    HoverHandler { cursorShape: mdView.hoveredLink ? Qt.PointingHandCursor : Qt.ArrowCursor }
                                 }
                             }
                             Column {

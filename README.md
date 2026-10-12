@@ -4,6 +4,8 @@ Browse, preview, upload and download files on your [dufs](https://github.com/sig
 
 - **Browse** folders as a list (sortable by name, size, date) or as a grid with image thumbnails
 - **Preview** images and text files (first 64 KB) in a side panel; double-click an image for full size
+- **Markdown** files preview rendered (headings, lists, tables, code, links that open in the browser), or as source
+- **Resize** the server list and the preview panel by dragging their edges; double-click an edge for the default width
 - **Upload** by dropping files onto the window, or with the Upload button; progress shows at the bottom
 - **Download** files, or whole folders as a `.zip`
 - **New folder, rename, delete, search**, copy a file's link, open it in the browser
