@@ -362,14 +362,18 @@ Item {
         var path
         try { path = decodeURIComponent(u.substring(best)) } catch (e) { path = u.substring(best) }
         if (!path || path.charAt(0) !== "/") path = "/" + path
+        openPlace(hit.id, path)
+        return true
+    }
+    // Opens a path on a server: a folder ("/a/") is listed, a file ("/a/b.md") is selected in its folder.
+    function openPlace(serverId, path) {
         var isDir = /\/$/.test(path)
         var dir = isDir ? path : path.substring(0, path.lastIndexOf("/") + 1)
         root.selectedPath = ""; root.requested = ({})
         root.pendingSelect = isDir ? "" : path
         var open = function () { callVia(coreName, "openDir", [dir], function (raw) { apply(parse(raw)) }) }
-        if (root.st.current !== hit.id) callVia(coreName, "selectServer", [hit.id], function (raw) { apply(parse(raw)); open() })
+        if (root.st.current !== serverId) callVia(coreName, "selectServer", [serverId], function (raw) { apply(parse(raw)); open() })
         else open()
-        return true
     }
     // After a dufs.open: select the file once its folder's listing is in.
     function selectPending() {
@@ -380,7 +384,42 @@ Item {
             root.activate(e[i])
             return
         }
+        if (root.st.path === root.pendingSelect.substring(0, root.pendingSelect.lastIndexOf("/") + 1)) {
+            toast(root.baseName(root.pendingSelect) + " is no longer in this folder.", true)
+            root.pendingSelect = ""
+        }
     }
+    // ── places: pinned and recently opened files/folders, kept by the core per server ──
+    readonly property var pins: st.pins || []
+    readonly property var recent: {
+        // Recent leaves out what is already pinned.
+        var p = {}, out = []
+        root.pins.forEach(function (x) { p[x.server + "|" + x.path] = true })
+        ;(st.recent || []).forEach(function (x) { if (!p[x.server + "|" + x.path]) out.push(x) })
+        return out
+    }
+    function baseName(path) {
+        var s = String(path || "").replace(/\/$/, "")
+        return s.substring(s.lastIndexOf("/") + 1) || "/"
+    }
+    function serverName(id) {
+        var s = root.servers
+        for (var i = 0; i < s.length; i++) if (s[i].id === id) return s[i].name
+        return ""
+    }
+    function isPinned(path) {
+        for (var i = 0; i < root.pins.length; i++)
+            if (root.pins[i].server === root.st.current && root.pins[i].path === path) return true
+        return false
+    }
+    function togglePin(path) {
+        if (!path || !root.st.current) return
+        var on = isPinned(path)
+        act(on ? "unpinPath" : "pinPath", [root.st.current, path], on ? "Unpinned " + baseName(path) : "Pinned " + baseName(path))
+    }
+    // A file the user opened goes to the top of Recent.
+    function touch(path) { if (root.st.current && path) callVia(coreName, "touchPath", [root.st.current, path], function (raw) { var o = parse(raw); if (o && o.ok !== false) apply(o) }) }
+
     // A link that opens this file or folder in Dufs, from another app, a note or a browser:
     // basecamp://intent/dufs.open?p=<base64url of {"url": …}>.
     function basecampLink(url) {
@@ -431,6 +470,7 @@ Item {
     function activate(e) {
         if (e.dir) { openDir(e.path); return }
         root.selectedPath = e.path
+        touch(e.path)
         wantPreview(e)
     }
     function wantPreview(e) {
@@ -594,7 +634,8 @@ Item {
                 Text { text: "SERVERS"; color: root.cFaint; font.pixelSize: 11; font.letterSpacing: 1.2; textFormat: Text.PlainText; Layout.topMargin: root.sp }
                 ListView {
                     Layout.fillWidth: true
-                    Layout.fillHeight: true
+                    // Servers take what they need, up to 40% of the column; Pinned/Recent get the rest.
+                    Layout.preferredHeight: Math.min(contentHeight, parent.height * 0.4)
                     clip: true
                     spacing: 4
                     model: root.servers
@@ -626,6 +667,112 @@ Item {
                     }
                 }
                 LogosButton { text: "+ Add server"; Layout.fillWidth: true; onClicked: serverDialog.openFor(null) }
+
+                // Pinned and Recent: click to open; a pinned row's ✕ unpins, a recent row's ☆ pins it.
+                ListView {
+                    id: placesList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.topMargin: root.sp
+                    clip: true
+                    spacing: 2
+                    boundsBehavior: Flickable.StopAtBounds
+                    model: {
+                        var m = []
+                        if (root.pins.length) {
+                            m.push({ hdr: "PINNED" })
+                            root.pins.forEach(function (x) { m.push({ place: x, pinned: true }) })
+                        }
+                        if (root.recent.length) {
+                            m.push({ hdr: "RECENT", clear: true })
+                            root.recent.forEach(function (x) { m.push({ place: x, pinned: false }) })
+                        }
+                        if (!m.length && root.servers.length)
+                            m.push({ hint: "Pin a file or folder from its ⋯ menu or the ☆ in the toolbar. Files you open show up here as Recent." })
+                        return m
+                    }
+                    delegate: Item {
+                        id: pRow
+                        required property var modelData
+                        width: ListView.view.width
+                        height: modelData.hdr ? 28 : modelData.hint ? hintText.implicitHeight + 8 : 40
+                        readonly property var pl: modelData.place || null
+                        readonly property bool isDir: !!pl && /\/$/.test(pl.path)
+                        readonly property bool here: !!pl && pl.server === root.st.current
+                            && (isDir ? root.st.path === pl.path : root.selectedPath === pl.path)
+                        Text {
+                            id: hintText
+                            visible: !!modelData.hint
+                            width: parent.width
+                            text: modelData.hint || ""
+                            color: root.cFaint; font.pixelSize: 11; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                        }
+                        RowLayout {
+                            visible: !!modelData.hdr
+                            anchors.fill: parent
+                            Text { text: modelData.hdr || ""; color: root.cFaint; font.pixelSize: 11; font.letterSpacing: 1.2; textFormat: Text.PlainText; Layout.fillWidth: true; Layout.alignment: Qt.AlignBottom }
+                            Text {
+                                visible: !!modelData.clear
+                                text: "Clear"; color: clearMouse.containsMouse ? root.cAccent : root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText
+                                Layout.alignment: Qt.AlignBottom
+                                MouseArea { id: clearMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("forgetRecent", ["", ""]) }
+                            }
+                        }
+                        Rectangle {
+                            visible: !!pRow.pl
+                            anchors.fill: parent
+                            radius: 6
+                            color: pRow.here ? root.cRaised : (pMouse.containsMouse ? Qt.darker(root.cRaised, 1.15) : "transparent")
+                            MouseArea {
+                                id: pMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.openPlace(pRow.pl.server, pRow.pl.path)
+                            }
+                            Text {
+                                id: pGlyph
+                                anchors.left: parent.left; anchors.leftMargin: 8; anchors.verticalCenter: parent.verticalCenter
+                                width: 18
+                                text: root.glyph(pRow.isDir ? "dir" : "")
+                                color: root.kindColor(pRow.isDir ? "dir" : ""); font.pixelSize: 15; textFormat: Text.PlainText
+                            }
+                            ColumnLayout {
+                                anchors.left: pGlyph.right; anchors.leftMargin: 6
+                                anchors.right: parent.right; anchors.rightMargin: 28
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 0
+                                Text { text: pRow.pl ? root.baseName(pRow.pl.path) : ""; color: root.cText; font.pixelSize: 13; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
+                                Text {
+                                    text: {
+                                        if (!pRow.pl) return ""
+                                        var p = pRow.pl.path.replace(/\/$/, "")
+                                        var dir = p.substring(0, p.lastIndexOf("/") + 1) || "/"
+                                        return (root.servers.length > 1 ? root.serverName(pRow.pl.server) + "  ·  " : "") + dir
+                                    }
+                                    color: root.cFaint; font.pixelSize: 10; elide: Text.ElideLeft; Layout.fillWidth: true; textFormat: Text.PlainText
+                                }
+                            }
+                            Text {
+                                visible: pMouse.containsMouse || xMouse.containsMouse
+                                anchors.right: parent.right; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter
+                                text: pRow.modelData.pinned ? "✕" : "☆"
+                                color: xMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 13; textFormat: Text.PlainText
+                                MouseArea {
+                                    id: xMouse
+                                    anchors.fill: parent; anchors.margins: -6
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        var x = pRow.pl
+                                        if (pRow.modelData.pinned) root.act("unpinPath", [x.server, x.path], "Unpinned " + root.baseName(x.path))
+                                        else root.act("pinPath", [x.server, x.path], "Pinned " + root.baseName(x.path))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Divider { onDragged: (dx) => root.sideW = root.clamp(startW + dx, 160, Math.min(440, root.width - 520)); onPressedAt: startW = root.sideW; onReset: root.sideW = 220 }
@@ -727,6 +874,16 @@ Item {
                             MouseArea { id: clearMouse; anchors.fill: parent; anchors.margins: -7; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: searchField.clearSearch() }
                         }
                         Connections { target: root; function onStChanged() { if (!searchField.activeFocus && (root.st.query || "") === "") searchField.text = "" } }
+                    }
+                    // Pin the folder you're in.
+                    LogosButton {
+                        Layout.preferredWidth: 38; Layout.preferredHeight: 34
+                        enabled: !!root.currentServer
+                        readonly property bool on: root.isPinned(root.st.path || "/")
+                        text: on ? "★" : "☆"
+                        ToolTip.visible: hovered; ToolTip.delay: 500
+                        ToolTip.text: on ? "Unpin this folder" : "Pin this folder"
+                        onClicked: root.togglePin(root.st.path || "/")
                     }
                     LogosButton { Layout.preferredWidth: 80; Layout.preferredHeight: 34; text: "Go to…"; enabled: !!root.currentServer; onClicked: root.startAddress() }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: root.gridMode ? "List" : "Grid"; enabled: !!root.currentServer; onClicked: root.gridMode = !root.gridMode }
@@ -1153,6 +1310,7 @@ Item {
                             LogosButton { Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
                             LogosButton { Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
                             LogosButton { Layout.fillWidth: true; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
+                            LogosButton { Layout.fillWidth: true; Layout.columnSpan: 2; text: !!root.selectedEntry && root.isPinned(root.selectedEntry.path) ? "Unpin" : "Pin"; onClicked: root.togglePin(root.selectedEntry.path) }
                         }
                     }
                 }
@@ -1246,6 +1404,7 @@ Item {
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Download as .zip" : "Download"; enabled: !(entryMenu.entry && entryMenu.entry.dir) || root.st.perms.archive !== false; onTriggered: { root.askSave(entryMenu.entry) } }
         MenuItem { text: "Copy link"; onTriggered: root.copyText(entryMenu.entry.url) }
         MenuItem { text: "Copy Basecamp link"; onTriggered: root.copyText(root.basecampLink(entryMenu.entry.url)) }
+        MenuItem { text: entryMenu.entry && root.isPinned(entryMenu.entry.path) ? "Unpin" : "Pin"; onTriggered: root.togglePin(entryMenu.entry.path) }
         MenuItem { text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
         MenuSeparator {}
         MenuItem { text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }

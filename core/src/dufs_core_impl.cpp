@@ -39,7 +39,8 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.1";
+static const char* kVersion = "0.1.3";
+static const size_t kMaxRecent = 12;
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
 static const int kMaxPreviewJobs = 3;
@@ -224,6 +225,12 @@ struct Server {
     std::string id, name, url, user, password, lastPath = "/";
 };
 
+// A pinned or recently opened file/folder: a path ("/a/b.md", or "/a/" for a folder) on a server.
+struct Place {
+    std::string server, path;
+    qint64 at = 0;
+};
+
 struct Transfer {
     std::string id, kind, name, path, local, state = "queued", error;
     qint64 done = 0, total = 0;
@@ -242,6 +249,7 @@ struct DufsCorePrivate {
     QNetworkAccessManager* nam = nullptr;
     std::vector<Server> servers;
     std::string currentId;
+    std::vector<Place> pins, recent;
 
     // listing of the current folder
     std::string path = "/";
@@ -301,6 +309,18 @@ struct DufsCorePrivate {
                 if (!sv.id.empty() && !sv.url.empty()) servers.push_back(sv);
             }
         }
+        auto places = [&](const char* key, std::vector<Place>& out) {
+            auto pl = j.find(key);
+            if (pl == j.end() || !pl->is_array()) return;
+            for (auto& x : *pl) {
+                if (!x.is_object()) continue;
+                Place p{jstr(x, "server", ""), jstr(x, "path", ""), (qint64)jnum(x, "at", 0)};
+                if (find(p.server) && !p.path.empty() && p.path[0] == '/') out.push_back(p);
+            }
+        };
+        places("pins", pins);
+        places("recent", recent);
+        if (recent.size() > kMaxRecent) recent.resize(kMaxRecent);
         currentId = jstr(j, "current", "");
         if (!find(currentId)) currentId = servers.empty() ? "" : servers.front().id;
         if (auto* s = current()) path = normDir(s->lastPath);
@@ -311,7 +331,8 @@ struct DufsCorePrivate {
         for (auto& s : servers)
             arr.push_back({{"id", s.id}, {"name", s.name}, {"url", s.url}, {"user", s.user},
                            {"password", s.password}, {"lastPath", s.lastPath}});
-        writeJsonFile(serversFile(), {{"servers", arr}, {"current", currentId}});
+        writeJsonFile(serversFile(), {{"servers", arr}, {"current", currentId},
+                                      {"pins", placesJson(pins)}, {"recent", placesJson(recent)}});
     }
 
     // ── URLs / requests
@@ -380,6 +401,19 @@ struct DufsCorePrivate {
         QTimer::singleShot(250, [this] { emitPending = false; q->stateChanged(state().dump()); });
     }
 
+    static json placesJson(const std::vector<Place>& v)
+    {
+        json a = json::array();
+        for (auto& p : v) a.push_back({{"server", p.server}, {"path", p.path}, {"at", p.at}});
+        return a;
+    }
+    static void dropPlace(std::vector<Place>& v, const std::string& server, const std::string& path)
+    {
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const Place& p) {
+            return p.server == server && (path.empty() || p.path == path);
+        }), v.end());
+    }
+
     json state()
     {
         json sv = json::array();
@@ -414,6 +448,8 @@ struct DufsCorePrivate {
             {"perms", perms},
             {"transfers", tr},
             {"previews", pv},
+            {"pins", placesJson(pins)},
+            {"recent", placesJson(recent)},
             {"previewCache", !viewDir.empty()},
             {"downloadsDir", QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString()},
             {"notice", notice},
@@ -847,6 +883,8 @@ std::string DufsCoreImpl::removeServer(const std::string& id)
     const auto before = v.size();
     v.erase(std::remove_if(v.begin(), v.end(), [&](const Server& s) { return s.id == id; }), v.end());
     if (v.size() == before) return json({{"ok", false}, {"error", "No such server."}}).dump();
+    DufsCorePrivate::dropPlace(d->pins, id, "");
+    DufsCorePrivate::dropPlace(d->recent, id, "");
     if (d->currentId == id) {
         d->currentId = v.empty() ? "" : v.front().id;
         d->path = v.empty() ? "/" : normDir(v.front().lastPath);
@@ -988,6 +1026,51 @@ std::string DufsCoreImpl::clearTransfers()
     v.erase(std::remove_if(v.begin(), v.end(), [](const Transfer& t) {
         return t.state == "done" || t.state == "failed" || t.state == "cancelled";
     }), v.end());
+    return d->state().dump();
+}
+
+static std::string placeError(const std::string& serverId, const std::string& path, DufsCorePrivate* d)
+{
+    if (!d->find(serverId)) return json({{"ok", false}, {"error", "No such server."}}).dump();
+    if (path.empty() || path[0] != '/') return json({{"ok", false}, {"error", "Not a path on the server."}}).dump();
+    return "";
+}
+
+std::string DufsCoreImpl::pinPath(const std::string& serverId, const std::string& path)
+{
+    std::string err = placeError(serverId, path, d);
+    if (!err.empty()) return err;
+    DufsCorePrivate::dropPlace(d->pins, serverId, path);
+    d->pins.push_back({serverId, path, QDateTime::currentMSecsSinceEpoch()});
+    d->save();
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::unpinPath(const std::string& serverId, const std::string& path)
+{
+    if (path.empty()) return json({{"ok", false}, {"error", "Not a path on the server."}}).dump();
+    DufsCorePrivate::dropPlace(d->pins, serverId, path);
+    d->save();
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::touchPath(const std::string& serverId, const std::string& path)
+{
+    std::string err = placeError(serverId, path, d);
+    if (!err.empty()) return err;
+    DufsCorePrivate::dropPlace(d->recent, serverId, path);
+    d->recent.insert(d->recent.begin(), {serverId, path, QDateTime::currentMSecsSinceEpoch()});
+    if (d->recent.size() > kMaxRecent) d->recent.resize(kMaxRecent);
+    d->save();
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::forgetRecent(const std::string& serverId, const std::string& path)
+{
+    if (serverId.empty()) d->recent.clear();
+    else if (path.empty()) return json({{"ok", false}, {"error", "Not a path on the server."}}).dump();
+    else DufsCorePrivate::dropPlace(d->recent, serverId, path);
+    d->save();
     return d->state().dump();
 }
 

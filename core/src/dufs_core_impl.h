@@ -63,6 +63,14 @@ public:
     // Image: fetched into the view's cache dir. Text: the first 64 KiB inline.
     std::string preview(const std::string& path);
 
+    // Places: pinned and recently opened files/folders ("/a/b.md", "/a/"), kept per server.
+    std::string pinPath(const std::string& serverId, const std::string& path);
+    std::string unpinPath(const std::string& serverId, const std::string& path);
+    // Moves the path to the top of the recent list (at most 12 kept).
+    std::string touchPath(const std::string& serverId, const std::string& path);
+    // An empty serverId clears the whole recent list.
+    std::string forgetRecent(const std::string& serverId, const std::string& path);
+
     // Opens an http(s) link in the system browser (the sandboxed view's Qt.openUrlExternally can't).
     std::string openUrl(const std::string& url);
 
