@@ -484,14 +484,22 @@ Item {
     function fileUrl(path) {
         return "file://" + String(path).split("/").map(function (seg) { return encodeURIComponent(seg) }).join("/")
     }
+    // A FRESH save dialog per download.
+    //
+    // Qt documents that `selectedFile` "can be set to control the file that is selected when
+    // the dialog is opened" - and this used to set exactly that on a REUSED dialog. But a
+    // reused dialog keeps the previous name in the native file picker, so downloading a second
+    // file was offered the FIRST file's name (dufs-basecamp#1: "when I downloaded one file and
+    // then tried to download another dufs would suggest the old name").
+    //
+    // Rather than depend on how the native layer caches its state, each download gets its own
+    // dialog: `active` is cleared on close, so the next open constructs a new one with no
+    // memory of the last name.
     function askSave(e) {
         if (!e) return
-        var dir = root.st.downloadsDir || ""
-        var name = e.name + (e.dir ? ".zip" : "")
-        saveDialog.target = e
-        if (dir) saveDialog.currentFolder = root.fileUrl(dir)
-        saveDialog.selectedFile = root.fileUrl((dir ? dir : "") + "/" + name)
-        saveDialog.open()
+        // A fresh object every time, so `pending` always CHANGES - including when the same
+        // file is downloaded twice in a row, which would otherwise not re-trigger anything.
+        saveLoader.pending = { e: e }
     }
     // A file-picker or drop URL -> its file name.
     function baseOf(u) {
@@ -1417,12 +1425,38 @@ Item {
         fileMode: FileDialog.OpenFiles
         onAccepted: root.uploadUrls(uploadDialog.selectedFiles)
     }
-    FileDialog {
-        id: saveDialog
-        property var target: null
-        title: "Save " + (target ? target.name : "")
-        fileMode: FileDialog.SaveFile
-        onAccepted: if (target) root.act("download", [target.path, String(saveDialog.selectedFile)])
+    Loader {
+        id: saveLoader
+        property var pending: null
+        active: false
+        sourceComponent: saveComp
+        onPendingChanged: {
+            if (!pending) return
+            active = true                       // constructs a NEW dialog (active was cleared on close)
+            if (item) item.open()
+        }
+    }
+    Component {
+        id: saveComp
+        FileDialog {
+            fileMode: FileDialog.SaveFile
+            // Set the pre-selection BEFORE open(), as Qt documents - on a dialog that has
+            // never been used before, so there is nothing stale to prefer.
+            Component.onCompleted: {
+                var p = saveLoader.pending
+                if (!p) return
+                var dir = root.st.downloadsDir || ""
+                var name = p.e.name + (p.e.dir ? ".zip" : "")
+                title = "Save " + p.e.name
+                if (dir) currentFolder = root.fileUrl(dir)
+                selectedFile = root.fileUrl((dir ? dir : "") + "/" + name)
+            }
+            onAccepted: {
+                var p = saveLoader.pending
+                if (p) root.act("download", [p.e.path, String(selectedFile)])
+            }
+            onClosed: saveLoader.active = false  // destroy it: the next download gets a clean one
+        }
     }
 
     component DField: TextField {
