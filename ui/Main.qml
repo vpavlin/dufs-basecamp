@@ -484,14 +484,27 @@ Item {
     function fileUrl(path) {
         return "file://" + String(path).split("/").map(function (seg) { return encodeURIComponent(seg) }).join("/")
     }
+    // A FRESH save dialog per download.
+    //
+    // Qt documents that `selectedFile` "can be set to control the file that is selected when
+    // the dialog is opened" - and this used to set exactly that on a REUSED dialog. But a
+    // reused dialog keeps the previous name in the native file picker, so downloading a second
+    // file was offered the FIRST file's name (dufs-basecamp#1: "when I downloaded one file and
+    // then tried to download another dufs would suggest the old name").
+    //
+    // Rather than depend on how the native layer caches its state, each download gets its own
+    // dialog: `active` is cleared on close, so the next open constructs a new one with no
+    // memory of the last name.
     function askSave(e) {
         if (!e) return
-        var dir = root.st.downloadsDir || ""
-        var name = e.name + (e.dir ? ".zip" : "")
-        saveDialog.target = e
-        if (dir) saveDialog.currentFolder = root.fileUrl(dir)
-        saveDialog.selectedFile = root.fileUrl((dir ? dir : "") + "/" + name)
-        saveDialog.open()
+        // Drop any dialog that is already up. Without this, a second askSave while the first
+        // dialog is open leaves the VISIBLE dialog showing the first file (Component.onCompleted
+        // runs once), while `pending` has already moved on - so accepting it would download the
+        // second file's content under the first file's approved name. (reviewer, 14/10)
+        saveLoader.active = false
+        // A fresh object every time, so `pending` always CHANGES - including when the same file
+        // is downloaded twice in a row, which would otherwise not re-trigger anything.
+        saveLoader.pending = { e: e }
     }
     // A file-picker or drop URL -> its file name.
     function baseOf(u) {
@@ -1417,12 +1430,48 @@ Item {
         fileMode: FileDialog.OpenFiles
         onAccepted: root.uploadUrls(uploadDialog.selectedFiles)
     }
-    FileDialog {
-        id: saveDialog
-        property var target: null
-        title: "Save " + (target ? target.name : "")
-        fileMode: FileDialog.SaveFile
-        onAccepted: if (target) root.act("download", [target.path, String(saveDialog.selectedFile)])
+    Loader {
+        id: saveLoader
+        property var pending: null
+        active: false
+        sourceComponent: saveComp
+        onPendingChanged: {
+            if (!pending) return
+            active = true                       // constructs a NEW dialog (active was cleared on close)
+            if (item) item.open()
+        }
+    }
+    Component {
+        id: saveComp
+        FileDialog {
+            fileMode: FileDialog.SaveFile
+            // The entry THIS dialog was opened for, captured once. `pending` is shared mutable
+            // state; if it moved on, acting on it would pair one file's path with another's
+            // chosen name. Capturing makes that pairing impossible by construction.
+            property var myEntry: null
+            // Set the pre-selection BEFORE open(), as Qt documents - on a dialog that has
+            // never been used before, so there is nothing stale to prefer.
+            Component.onCompleted: {
+                var p = saveLoader.pending
+                if (!p) return
+                myEntry = p.e
+                var dir = root.st.downloadsDir || ""
+                var name = p.e.name + (p.e.dir ? ".zip" : "")
+                title = "Save " + p.e.name
+                if (dir) currentFolder = root.fileUrl(dir)
+                selectedFile = root.fileUrl((dir ? dir : "") + "/" + name)
+            }
+            // QtQuick.Dialogs.FileDialog has exactly two signals, accepted() and rejected() -
+            // there is NO `closed`. (QtQuick.Controls Dialog, used elsewhere in this file, does
+            // have one; FileDialog is a separate, older hierarchy that never gained it. Hooking
+            // onClosed here failed to load the whole view: reviewer, 14/10.)
+            onAccepted: {
+                var e = myEntry
+                saveLoader.active = false            // destroy before acting; a re-entrant askSave cannot reach this dialog
+                if (e) root.act("download", [e.path, String(selectedFile)])
+            }
+            onRejected: saveLoader.active = false
+        }
     }
 
     component DField: TextField {
