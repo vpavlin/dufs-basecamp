@@ -19,6 +19,9 @@ struct DufsCorePrivate;
  *  - requests are asynchronous; progress and results arrive through snapshot() and
  *    the stateChanged event
  *
+ * Logos Storage is a dependency (storage_module): its node lists the files it holds, takes files
+ * from this computer or a dufs server, and gives them back to either.
+ *
  * Servers (with an optional login) are kept in $HOME/.dufs-basecamp/servers.json
  * (override the directory with DUFS_CORE_DATA).
  */
@@ -70,6 +73,26 @@ public:
     std::string touchPath(const std::string& serverId, const std::string& path);
     // An empty serverId clears the whole recent list.
     std::string forgetRecent(const std::string& serverId, const std::string& path);
+
+    // ── Logos Storage: this computer's node (on Basecamp 0.3, the host's), shown as one more place
+    // beside the servers. Results arrive through snapshot().storage and the transfer list.
+
+    // Starts using the node (once) and lists the files it holds.
+    std::string storageRefresh();
+    // localPathsJson as for upload(): the files go into Storage.
+    std::string storageUpload(const std::string& localPathsJson);
+    // A file in Storage, by its CID, to a file on this computer.
+    std::string storageDownload(const std::string& cid, const std::string& localPath);
+    // Fetches a CID someone shared, so this node holds it (and serves it, when announcing).
+    std::string storageAdd(const std::string& cid);
+    // Drops a file from this node.
+    std::string storageRemove(const std::string& cid);
+    // A file on a dufs server into Storage.
+    std::string sendToStorage(const std::string& serverId, const std::string& path);
+    // A file in Storage onto a dufs server, into dir ("/a/b/").
+    std::string saveToServer(const std::string& cid, const std::string& serverId, const std::string& dir);
+    // settingsJson: {"advertise": true} announces what is put into Storage, so others can fetch it by CID.
+    std::string storageSettings(const std::string& settingsJson);
 
     // Opens an http(s) link in the system browser (the sandboxed view's Qt.openUrlExternally can't).
     std::string openUrl(const std::string& url);

@@ -257,11 +257,35 @@ Item {
     readonly property bool coreLost: root.coreSeen && root.missedPolls >= 4
 
     readonly property var servers: st.servers || []
+    // Logos Storage: shown in place of a server when picked in the sidebar.
+    property bool storageMode: false
+    readonly property var storage: st.storage || ({ state: "off", files: [] })
+    readonly property string storageLine: {
+        var s = root.storage, n = (s.files || []).length
+        if (s.state === "error") return s.error || "Not available"
+        if (s.state === "starting" || s.state === "off") return "Starting…"
+        return n === 1 ? "1 file on this computer" : n + " files on this computer"
+    }
+    function openStorage() {
+        root.storageMode = true
+        root.selectedPath = ""
+        act("storageRefresh", [])
+    }
+    function storeUrls(urls) {
+        var list = []
+        for (var i = 0; i < urls.length; i++) list.push(String(urls[i]))
+        if (!list.length) return
+        act("storageUpload", [JSON.stringify(list)], list.length === 1 ? "Putting 1 file into Storage" : "Putting " + list.length + " files into Storage")
+    }
+    function sendToStorage(e) {
+        if (!e || e.dir || !root.st.current) return
+        act("sendToStorage", [root.st.current, e.path], "Sending " + e.name + " to Logos Storage")
+    }
     readonly property var currentServer: {
         for (var i = 0; i < servers.length; i++) if (servers[i].id === st.current) return servers[i]
         return null
     }
-    readonly property bool anyActive: !!st.loading || activeTransfers > 0 || pendingPreviews > 0
+    readonly property bool anyActive: !!st.loading || activeTransfers > 0 || pendingPreviews > 0 || root.storage.state === "starting"
     readonly property int activeTransfers: {
         var n = 0, t = st.transfers || []
         for (var i = 0; i < t.length; i++) if (t[i].state === "running" || t[i].state === "queued") n++
@@ -571,6 +595,30 @@ Item {
         default: return root.cFaint
         }
     }
+    // Transfers that involve Logos Storage say which way they go.
+    function transferGlyph(t) {
+        switch (t.kind) {
+        case "upload": return "↑"
+        case "store": case "promote": return "⇢"
+        case "demote": return "⇠"
+        case "add": return "+"
+        default: return "↓"
+        }
+    }
+    function transferDone(t) {
+        switch (t.kind) {
+        case "download": case "fetch": return "Saved"
+        case "store": case "promote": return "In Storage"
+        case "demote": return "On " + root.serverName(t.server)
+        case "add": return "Held here"
+        default: return "Done"
+        }
+    }
+    function transferStep(t) {
+        if (t.kind === "promote") return t.phase === "http" ? "From the server: " : "Into Storage: "
+        if (t.kind === "demote") return t.phase === "http" ? "To the server: " : "From Storage: "
+        return ""
+    }
     function copyText(t) { clip.text = t; clip.selectAll(); clip.copy(); clip.deselect(); toast("Copied", false) }
 
     // ── toasts
@@ -657,11 +705,11 @@ Item {
                         width: ListView.view.width
                         height: 52
                         radius: 8
-                        readonly property bool active: modelData.id === root.st.current
+                        readonly property bool active: modelData.id === root.st.current && !root.storageMode
                         color: active ? root.cRaised : (sMouse.containsMouse ? Qt.darker(root.cRaised, 1.15) : "transparent")
                         border.width: active ? 1 : 0
                         border.color: root.cAccent
-                        MouseArea { id: sMouse; anchors.fill: parent; hoverEnabled: true; onClicked: if (!parent.active) { root.selectedPath = ""; root.requested = ({}); root.act("selectServer", [modelData.id]) } }
+                        MouseArea { id: sMouse; anchors.fill: parent; hoverEnabled: true; onClicked: if (!parent.active) { root.storageMode = false; root.selectedPath = ""; root.requested = ({}); if (modelData.id !== root.st.current) root.act("selectServer", [modelData.id]) } }
                         ColumnLayout {
                             anchors.fill: parent
                             anchors.leftMargin: 10
@@ -680,6 +728,30 @@ Item {
                     }
                 }
                 LogosButton { text: "+ Add server"; Layout.fillWidth: true; onClicked: serverDialog.openFor(null) }
+                // Logos Storage, as one more place beside the servers.
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.topMargin: root.sp
+                    height: 52
+                    radius: 8
+                    color: root.storageMode ? root.cRaised : (lsMouse.containsMouse ? Qt.darker(root.cRaised, 1.15) : "transparent")
+                    border.width: root.storageMode ? 1 : 0
+                    border.color: root.cAccent
+                    MouseArea { id: lsMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.openStorage() }
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 0
+                        Item { Layout.fillHeight: true }
+                        Text { text: "Logos Storage"; color: root.cText; font.pixelSize: 14; font.bold: root.storageMode; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
+                        Text {
+                            text: root.storage.state === "off" ? "Files by CID, on this computer" : root.storageLine
+                            color: root.storage.state === "error" ? root.cBad : root.cFaint; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText
+                        }
+                        Item { Layout.fillHeight: true }
+                    }
+                }
 
                 // Pinned and Recent: click to open; a pinned row's ✕ unpins, a recent row's ☆ pins it.
                 ListView {
@@ -741,7 +813,7 @@ Item {
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: root.openPlace(pRow.pl.server, pRow.pl.path)
+                                onClicked: { root.storageMode = false; root.openPlace(pRow.pl.server, pRow.pl.path) }
                             }
                             Text {
                                 id: pGlyph
@@ -798,6 +870,7 @@ Item {
 
             // toolbar
             Rectangle {
+                visible: !root.storageMode
                 Layout.fillWidth: true
                 Layout.preferredHeight: 56
                 color: root.cBg
@@ -905,7 +978,7 @@ Item {
                     LogosButton { Layout.preferredWidth: 44; Layout.preferredHeight: 34; text: "↻"; enabled: !!root.currentServer; onClicked: root.act("refresh", []) }
                 }
             }
-            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
+            Rectangle { visible: !root.storageMode; Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
 
             Rectangle {
                 Layout.fillWidth: true
@@ -926,6 +999,7 @@ Item {
 
             // listing + preview
             RowLayout {
+                visible: !root.storageMode
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 spacing: 0
@@ -1323,9 +1397,154 @@ Item {
                             LogosButton { Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
                             LogosButton { Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
                             LogosButton { Layout.fillWidth: true; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
-                            LogosButton { Layout.fillWidth: true; Layout.columnSpan: 2; text: !!root.selectedEntry && root.isPinned(root.selectedEntry.path) ? "Unpin" : "Pin"; onClicked: root.togglePin(root.selectedEntry.path) }
+                            LogosButton { Layout.fillWidth: true; text: !!root.selectedEntry && root.isPinned(root.selectedEntry.path) ? "Unpin" : "Pin"; onClicked: root.togglePin(root.selectedEntry.path) }
+                            LogosButton { Layout.fillWidth: true; text: "To Logos Storage"; onClicked: root.sendToStorage(root.selectedEntry) }
                         }
                     }
+                }
+            }
+
+            // Logos Storage: what this computer's node holds
+            ColumnLayout {
+                visible: root.storageMode
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                spacing: 0
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 56
+                    color: root.cBg
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: root.sp * 2
+                        anchors.rightMargin: root.sp * 2
+                        spacing: root.sp
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            Text { text: "Logos Storage"; color: root.cText; font.pixelSize: 15; font.bold: true; textFormat: Text.PlainText }
+                            Text {
+                                text: root.storageLine
+                                color: root.storage.state === "error" ? root.cBad : root.cFaint
+                                font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText
+                            }
+                        }
+                        CheckBox {
+                            id: announceBox
+                            checked: root.storage.advertise !== false
+                            onToggled: { root.act("storageSettings", [JSON.stringify({ advertise: checked })]); checked = Qt.binding(function () { return root.storage.advertise !== false }) }
+                            ToolTip.visible: hovered; ToolTip.delay: 500
+                            ToolTip.text: "Announce what you put into Storage, so others can fetch it by its CID. Off: it stays on this computer only."
+                        }
+                        Text {
+                            text: "Announce"; color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                            Layout.leftMargin: -root.sp
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: announceBox.toggle(), announceBox.toggled() }
+                        }
+                        LogosButton { Layout.preferredWidth: 110; Layout.preferredHeight: 34; text: "Add by CID"; onClicked: cidDialog.open() }
+                        LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Upload"; onClicked: storageUploadDialog.open() }
+                        LogosButton { Layout.preferredWidth: 44; Layout.preferredHeight: 34; text: "↻"; onClicked: root.act("storageRefresh", []) }
+                    }
+                }
+                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
+                Item {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    ListView {
+                        id: storageList
+                        anchors.fill: parent
+                        clip: true
+                        model: root.storage.files || []
+                        ScrollBar.vertical: ScrollBar {}
+                        delegate: Rectangle {
+                            required property var modelData
+                            width: storageList.width
+                            height: 48
+                            color: stMouse.containsMouse ? root.cSurface : "transparent"
+                            MouseArea {
+                                id: stMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                onClicked: storageMenu.popupFor(modelData)
+                            }
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: root.sp * 2
+                                anchors.rightMargin: root.sp * 2
+                                spacing: 12
+                                Text { text: root.glyph(modelData.kind); color: root.kindColor(modelData.kind); font.pixelSize: 18; Layout.preferredWidth: 22; horizontalAlignment: Text.AlignHCenter; textFormat: Text.PlainText }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 1
+                                    Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
+                                    Text {
+                                        text: (modelData.from ? "from " + modelData.from + "  ·  " : "") + modelData.cid
+                                        color: root.cFaint; font.pixelSize: 11; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText
+                                    }
+                                }
+                                Text { text: root.fmtSize(modelData.size, false); color: root.cSub; font.pixelSize: 12; Layout.preferredWidth: 80; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
+                                Text { text: modelData.at ? root.fmtDate(modelData.at) : ""; color: root.cFaint; font.pixelSize: 12; Layout.preferredWidth: 120; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
+                                Text { text: "⋯"; color: root.cSub; font.pixelSize: 18; textFormat: Text.PlainText }
+                            }
+                        }
+                    }
+                    // empty, starting, error
+                    Column {
+                        anchors.centerIn: parent
+                        width: Math.min(parent.width - 48, 480)
+                        spacing: 12
+                        visible: (root.storage.files || []).length === 0
+                        Text {
+                            width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                            color: root.storage.state === "error" ? root.cBad : root.cText
+                            font.pixelSize: 17
+                            text: root.storage.state === "error" ? root.storage.error
+                                : root.storage.state === "ready" ? "Nothing in Logos Storage yet"
+                                : "Starting Logos Storage…"
+                        }
+                        Text {
+                            width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                            color: root.cFaint; font.pixelSize: 13
+                            visible: root.storage.state !== "starting"
+                            text: root.storage.state === "error" ? "Basecamp starts Storage a moment after it opens. If this stays, check that the Storage module is installed."
+                                : "Drop files here, upload them, send a file from a dufs server (its ⋯ menu), or add one someone shared by its CID."
+                        }
+                        LogosButton {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            visible: root.storage.state === "error"
+                            text: "Try again"
+                            onClicked: root.act("storageRefresh", [])
+                        }
+                    }
+                    DropArea {
+                        anchors.fill: parent
+                        onEntered: (drag) => { root.dropHover = drag.hasUrls; if (drag.hasUrls) drag.accept(Qt.CopyAction) }
+                        onExited: root.dropHover = false
+                        onDropped: (drop) => { root.dropHover = false; if (drop.hasUrls) { drop.accept(Qt.CopyAction); root.storeUrls(drop.urls) } }
+                    }
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        visible: root.dropHover && root.storageMode
+                        radius: 12
+                        color: Qt.rgba(root.cAccent.r, root.cAccent.g, root.cAccent.b, 0.10)
+                        border.width: 2
+                        border.color: root.cAccent
+                        Text { anchors.centerIn: parent; text: "Drop to put into Logos Storage"; color: root.cText; font.pixelSize: 18; font.bold: true; textFormat: Text.PlainText }
+                    }
+                }
+                // What sharing through Storage means, once, where it applies.
+                Text {
+                    Layout.fillWidth: true
+                    Layout.margins: root.sp * 2
+                    wrapMode: Text.WordWrap
+                    textFormat: Text.PlainText
+                    color: root.cFaint
+                    font.pixelSize: 11
+                    text: root.storage.advertise !== false
+                        ? "Anyone with a file's CID can fetch it from this computer while it is online and reachable, so Storage is public to whoever you give the CID. Keep private files on your dufs servers."
+                        : "Not announcing: what you put in now stays on this computer, and others can't fetch it."
                 }
             }
 
@@ -1356,7 +1575,7 @@ Item {
                             width: ListView.view.width
                             height: 30
                             spacing: 10
-                            Text { text: modelData.kind === "upload" ? "↑" : "↓"; color: root.cSub; font.pixelSize: 14; textFormat: Text.PlainText }
+                            Text { text: root.transferGlyph(modelData); color: root.cSub; font.pixelSize: 14; textFormat: Text.PlainText; Layout.preferredWidth: 16 }
                             Text { text: modelData.name; color: root.cText; font.pixelSize: 13; elide: Text.ElideMiddle; Layout.preferredWidth: 220; textFormat: Text.PlainText }
                             Rectangle {
                                 Layout.fillWidth: true
@@ -1376,10 +1595,10 @@ Item {
                                 font.pixelSize: 12
                                 color: modelData.state === "failed" ? root.cBad : root.cSub
                                 text: modelData.state === "failed" ? modelData.error
-                                    : modelData.state === "done" ? (modelData.kind === "download" ? "Saved" : "Done") + "  ·  " + root.fmtSize(modelData.total, false)
+                                    : modelData.state === "done" ? root.transferDone(modelData) + "  ·  " + root.fmtSize(modelData.total, false)
                                     : modelData.state === "cancelled" ? "Cancelled"
                                     : modelData.state === "queued" ? "Waiting"
-                                    : root.fmtSize(modelData.done, false) + " of " + root.fmtSize(modelData.total, false)
+                                    : root.transferStep(modelData) + (modelData.total > 0 ? root.fmtSize(modelData.done, false) + " of " + root.fmtSize(modelData.total, false) : "finding it…")
                             }
                             Text {
                                 visible: modelData.state === "running" || modelData.state === "queued"
@@ -1419,6 +1638,7 @@ Item {
         MenuItem { text: "Copy Basecamp link"; onTriggered: root.copyText(root.basecampLink(entryMenu.entry.url)) }
         MenuItem { text: entryMenu.entry && root.isPinned(entryMenu.entry.path) ? "Unpin" : "Pin"; onTriggered: root.togglePin(entryMenu.entry.path) }
         MenuItem { text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
+        MenuItem { text: "Send to Logos Storage"; enabled: !!entryMenu.entry && !entryMenu.entry.dir; onTriggered: root.sendToStorage(entryMenu.entry) }
         MenuSeparator {}
         MenuItem { text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }
         MenuItem { text: "Delete"; enabled: root.st.perms.delete !== false; onTriggered: confirmDialog.ask(entryMenu.entry) }
@@ -1468,7 +1688,8 @@ Item {
             onAccepted: {
                 var e = myEntry
                 saveLoader.active = false            // destroy before acting; a re-entrant askSave cannot reach this dialog
-                if (e) root.act("download", [e.path, String(selectedFile)])
+                if (e && e.cid) root.act("storageDownload", [e.cid, String(selectedFile)])
+                else if (e) root.act("download", [e.path, String(selectedFile)])
             }
             onRejected: saveLoader.active = false
         }
@@ -1644,6 +1865,100 @@ Item {
                 Item { Layout.fillWidth: true }
                 LogosButton { text: "Cancel"; onClicked: removeDialog.close() }
                 LogosButton { text: "Remove"; onClicked: { var s = removeDialog.server; removeDialog.close(); root.selectedPath = ""; root.act("removeServer", [s.id]) } }
+            }
+        }
+    }
+
+
+    // ── Logos Storage: menus and dialogs
+    Menu {
+        id: storageMenu
+        property var file: null
+        function popupFor(f) { file = f; popup() }
+        MenuItem { text: "Download…"; onTriggered: root.askSave({ name: storageMenu.file.name, cid: storageMenu.file.cid, dir: false }) }
+        MenuItem { text: "Save to a dufs server…"; enabled: root.servers.length > 0; onTriggered: toServerDialog.ask(storageMenu.file) }
+        MenuItem { text: "Copy CID"; onTriggered: root.copyText(storageMenu.file.cid) }
+        MenuSeparator {}
+        MenuItem { text: "Remove from Storage"; onTriggered: root.act("storageRemove", [storageMenu.file.cid]) }
+    }
+    FileDialog {
+        id: storageUploadDialog
+        title: "Put into Logos Storage"
+        fileMode: FileDialog.OpenFiles
+        onAccepted: root.storeUrls(storageUploadDialog.selectedFiles)
+    }
+    Popup {
+        id: cidDialog
+        anchors.centerIn: parent
+        width: 460
+        modal: true
+        padding: 20
+        onOpened: { cidField.text = ""; cidField.forceActiveFocus() }
+        function done() {
+            var c = cidField.text.trim()
+            if (!c) return
+            close()
+            root.act("storageAdd", [c], "Fetching it from Storage")
+        }
+        background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
+        contentItem: ColumnLayout {
+            spacing: 10
+            Text { text: "Add by CID"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
+            Text {
+                text: "A CID someone shared. This computer fetches the file and keeps it, and serves it too while announcing."
+                color: root.cSub; font.pixelSize: 13; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
+            }
+            DField { id: cidField; placeholderText: "zDvZ…"; onAccepted: cidDialog.done() }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                LogosButton { text: "Cancel"; onClicked: cidDialog.close() }
+                LogosButton { text: "Add"; onClicked: cidDialog.done() }
+            }
+        }
+    }
+    Popup {
+        id: toServerDialog
+        property var file: null
+        function ask(f) {
+            file = f
+            var cur = -1
+            for (var i = 0; i < root.servers.length; i++) if (root.servers[i].id === root.st.current) cur = i
+            serverBox.currentIndex = Math.max(0, cur)
+            dirField.text = cur >= 0 ? (root.st.path || "/") : "/"
+            open()
+        }
+        function done() {
+            var s = root.servers[serverBox.currentIndex]
+            if (!s || !file) return
+            var dir = dirField.text.trim() || "/"
+            if (dir.charAt(0) !== "/") dir = "/" + dir
+            close()
+            root.act("saveToServer", [file.cid, s.id, dir], "Saving " + file.name + " to " + s.name)
+        }
+        anchors.centerIn: parent
+        width: 440
+        modal: true
+        padding: 20
+        background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
+        contentItem: ColumnLayout {
+            spacing: 8
+            Text { text: "Save " + (toServerDialog.file ? toServerDialog.file.name : "") + " to a server"; color: root.cText; font.pixelSize: 17; font.bold: true; wrapMode: Text.WrapAnywhere; Layout.fillWidth: true; textFormat: Text.PlainText }
+            DLabel { text: "Server"; Layout.topMargin: 6 }
+            ComboBox {
+                id: serverBox
+                Layout.fillWidth: true
+                model: root.servers.map(function (s) { return s.name })
+                onActivated: dirField.text = root.servers[currentIndex] && root.servers[currentIndex].id === root.st.current ? (root.st.path || "/") : "/"
+            }
+            DLabel { text: "Folder" }
+            DField { id: dirField; placeholderText: "/"; onAccepted: toServerDialog.done() }
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 10
+                Item { Layout.fillWidth: true }
+                LogosButton { text: "Cancel"; onClicked: toServerDialog.close() }
+                LogosButton { text: "Save"; onClicked: toServerDialog.done() }
             }
         }
     }
