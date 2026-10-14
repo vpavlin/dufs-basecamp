@@ -1479,7 +1479,7 @@ Item {
                                     spacing: 1
                                     Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
                                     Text {
-                                        text: (modelData.from ? "from " + modelData.from + "  ·  " : "") + modelData.cid
+                                        text: (modelData.from ? (/^(added|by CID)/.test(modelData.from) ? modelData.from : "from " + modelData.from) + "  ·  " : "") + modelData.cid
                                         color: root.cFaint; font.pixelSize: 11; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText
                                     }
                                 }
