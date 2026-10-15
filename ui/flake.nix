@@ -6,7 +6,7 @@
     logos-module-builder.url = "github:logos-co/logos-module-builder/0.3.1";
     # A GitHub ref, not path:../core: a relative path lock breaks a clean clone on some Nix versions.
     # The view only needs the core's interface (LIDL), so this pins the commit that defines it.
-    dufs_core.url = "github:vpavlin/dufs-basecamp/1eff8bf6c5cf48a61faef7bac3dae998db2c92db?dir=core";
+    dufs_core.url = "github:vpavlin/dufs-basecamp/9856b6d967fbf16f3bfefb41e49df2814c10eb67?dir=core";
     dufs_core.inputs.logos-module-builder.follows = "logos-module-builder";
   };
 
