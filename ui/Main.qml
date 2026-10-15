@@ -1433,6 +1433,13 @@ Item {
                             LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
                             LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "Copy CID"; onClicked: root.copyText(root.selectedEntry.cid) }
                             LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "To a dufs server…"; enabled: root.dufsServers.length > 0 && !(root.selectedEntry && root.selectedEntry.partial); onClicked: toServerDialog.ask(root.selectedEntry) }
+                            // Only the manifest came: fetch the data again (the same as Add by CID).
+                            LogosButton {
+                                visible: root.isStorage && !!root.selectedEntry && root.selectedEntry.partial === "missing"
+                                Layout.fillWidth: true
+                                text: "Fetch it again"
+                                onClicked: root.act("storageAdd", [root.selectedEntry.cid], "Fetching " + root.selectedEntry.name + " again")
+                            }
                             LogosButton {
                                 visible: root.isStorage && !!root.storageNode
                                 Layout.fillWidth: true
