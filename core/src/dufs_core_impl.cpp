@@ -45,7 +45,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.2.5";
+static const char* kVersion = "0.2.6";
 static const size_t kMaxRecent = 12;
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
@@ -331,6 +331,7 @@ struct DufsCorePrivate {
         // Storage lists a dataset once its manifest is in, before (and without) its data.
         std::set<std::string> incomplete;
         bool relistArmed = false;            // a refresh failed after a good listing: one more is due
+        std::string version;                 // kLocal: storage_module's version (3.0.3 has the download fix)
     };
     StNode nodes[2];
     bool stPollArmed = false, stAdvertise = true;
@@ -345,9 +346,11 @@ struct DufsCorePrivate {
     explicit DufsCorePrivate(DufsCoreImpl* qq) : q(qq), loop(new QObject()) {}
     ~DufsCorePrivate() { delete loop; }
 
-    bool storageBusy(const std::string& cid)
+    // A transfer of this CID already running on this node (the other node may fetch it at the same time).
+    bool storageBusy(const std::string& cid, int n)
     {
-        for (auto& t : transfers) if (t.state == "running" && t.cid == cid) return true;
+        for (auto& t : transfers)
+            if (t.state == "running" && t.cid == cid && (t.node == n || (t.kind == "copy" && t.copyTo == n))) return true;
         return false;
     }
 
@@ -554,6 +557,7 @@ struct DufsCorePrivate {
             {"previewCache", !viewDir.empty()},
             {"downloadsDir", QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString()},
             {"storage", {{"advertise", stAdvertise}, {"node", nodes[kRemote].url}, {"hostOwned", nodes[kLocal].hostOwned},
+                         {"localVersion", nodes[kLocal].version},
                          {"files", storageNames()}}},
             {"notice", notice},
             {"noticeKind", noticeKind},
@@ -889,6 +893,14 @@ struct DufsCorePrivate {
                 return;
             }
         }
+        // Which storage_module: before 3.0.3 its downloads ignore a holder that answered (libstorage,
+        // logos-storage-nim #1540), so a stuck download can say what would fix it.
+        if (n == kLocal)
+            q->modules().storage_module.moduleVersionAsyncResult([this](logos::AsyncResult<std::string> ar) {
+                if (!ar.ok()) return;
+                const std::string v = ar.value;
+                onLoop([this, v] { nodes[kLocal].version = v; changed(); });
+            }, kStorageCallMs);
         // start() also when the host started it already: harmless, and it answers either way.
         const std::string what = n == kLocal ? "Logos Storage did not answer (" : "The Storage gateway did not answer (";
         const std::string hint = n == kLocal ? "). Is storage_module installed?" : "). Is storage_gateway installed?";
@@ -945,7 +957,7 @@ struct DufsCorePrivate {
                            {"mtime", jnum(f, "at", 0)}, {"url", ""}, {"cid", cid},
                            {"from", jstr(f, "from", "")}, {"mime", jstr(f, "mime", "")},
                            // "arriving" (an add still running) or "missing" (only the manifest came)
-                           {"partial", !N.incomplete.count(cid) ? "" : storageBusy(cid) ? "arriving" : "missing"}});
+                           {"partial", !N.incomplete.count(cid) ? "" : storageBusy(cid, n) ? "arriving" : "missing"}});
         }
         entries = out;
     }
@@ -2145,7 +2157,7 @@ std::string DufsCoreImpl::storageDownload(const std::string& cidIn, const std::s
     if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID."}}).dump();
     const std::string local = localPathFrom(localPath);
     if (local.empty()) return json({{"ok", false}, {"error", "Choose where to save it."}}).dump();
-    if (d->storageBusy(cid)) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    if (d->storageBusy(cid, d->activeNode())) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
     const int n = d->activeNode();
     d->ensureStorage(n);
     Transfer& t = d->newStorageTransfer(n, "fetch", baseName(local));
@@ -2159,7 +2171,7 @@ std::string DufsCoreImpl::storageAdd(const std::string& cidIn)
 {
     const std::string cid = cleanCid(cidIn);
     if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID. It looks like zDvZ… or bafy…"}}).dump();
-    if (d->storageBusy(cid)) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    if (d->storageBusy(cid, d->activeNode())) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
     const int n = d->activeNode();
     d->ensureStorage(n);
     Transfer& t = d->newStorageTransfer(n, "add", cid.substr(0, 12) + "…");
@@ -2178,7 +2190,7 @@ std::string DufsCoreImpl::storageCopy(const std::string& cidIn, const std::strin
     if (to < 0) return json({{"ok", false}, {"error", "No such Storage node."}}).dump();
     if (to == from) return json({{"ok", false}, {"error", "It is already there."}}).dump();
     if (d->nodes[from].incomplete.count(cid)) return json({{"ok", false}, {"error", "Its data hasn't arrived here yet."}}).dump();
-    if (d->storageBusy(cid)) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    if (d->storageBusy(cid, to)) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
     std::string name = cid;
     for (auto& f : d->nodes[from].files) if (jstr(f, "cid", "") == cid && !jstr(f, "name", "").empty()) name = jstr(f, "name", "");
     if (name.find('/') != std::string::npos) name = baseName(name);
@@ -2237,7 +2249,7 @@ std::string DufsCoreImpl::saveToServer(const std::string& cidIn, const std::stri
     if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID."}}).dump();
     Server* s = d->find(serverId);
     if (!s) return json({{"ok", false}, {"error", "No such server."}}).dump();
-    if (d->storageBusy(cid)) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    if (d->storageBusy(cid, d->activeNode())) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
     // The file's name in Storage, else the CID.
     std::string name = cid;
     const int n = d->activeNode();

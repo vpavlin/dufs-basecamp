@@ -278,6 +278,23 @@ Item {
         var m = /^http:\/\/(\[[^\]]+\]|[^\/:]+)/.exec(String(url || ""))
         return m ? m[1] : String(url || "")
     }
+    // This computer's Storage Module before 3.0.3 finds a file's holder and then ignores it (libstorage,
+    // fixed in logos-storage-nim #1540): say so where a download is stuck.
+    readonly property string oldStorageHint: {
+        var v = String(root.storage.localVersion || "")
+        if (!v || !root.currentServer || root.currentServer.remote) return ""
+        var a = v.split(".").map(Number), b = [3, 0, 3]
+        for (var i = 0; i < 3; i++) { if ((a[i] || 0) > b[i]) return ""; if ((a[i] || 0) < b[i]) break; if (i === 2) return "" }
+        return "\n\nThis computer's Storage Module is " + v + ": its downloads often find the holder and then get no data. Version 3.0.3 fixes that; update Storage Module in Basecamp's package manager and restart Basecamp."
+    }
+    // A file whose data hasn't come: stop a fetch that is still trying, then fetch it again.
+    function refetch(e) {
+        if (!e || !e.cid) return
+        var running = (root.st.transfers || []).filter(function (t) { return t.cid === e.cid && (t.state === "running" || t.state === "queued") })
+        var again = function () { root.act("storageAdd", [e.cid], "Fetching " + e.name + " again") }
+        if (!running.length) { again(); return }
+        callVia(coreName, "cancelTransfer", [running[0].id], function (raw) { var o = parse(raw); if (o && o.ok !== false) apply(o); again() })
+    }
     // "from pi5 · " / "added by CID · " before a CID, as the core recorded where a file came from.
     function storageOrigin(e) {
         if (!e || !e.from) return ""
@@ -1414,8 +1431,8 @@ Item {
                                     color: root.cFaint
                                     font.pixelSize: 12
                                     textFormat: Text.PlainText
-                                    text: root.selectedEntry && root.selectedEntry.partial === "arriving" ? "Still arriving: the preview shows once its data is here."
-                                        : root.selectedEntry && root.selectedEntry.partial === "missing" ? "Only the file's description reached this node, not its data: whoever has it wasn't reachable. Copy it here from your other Storage node, or add it by CID again later."
+                                    text: root.selectedEntry && root.selectedEntry.partial === "arriving" ? "Still arriving: the preview shows once its data is here." + root.oldStorageHint
+                                        : root.selectedEntry && root.selectedEntry.partial === "missing" ? "Only the file's description reached this node, not its data. Fetch it again, or copy it here from your other Storage node." + root.oldStorageHint
                                         : !root.selectedPreview ? (root.selectedEntry && (root.selectedEntry.kind === "image" || root.selectedEntry.kind === "text") ? "Loading preview..." : "No preview for this kind of file")
                                         : root.selectedPreview.state === "loading" ? "Loading preview..."
                                         : (root.selectedPreview.error || "")
@@ -1433,12 +1450,13 @@ Item {
                             LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
                             LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "Copy CID"; onClicked: root.copyText(root.selectedEntry.cid) }
                             LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "To a dufs server…"; enabled: root.dufsServers.length > 0 && !(root.selectedEntry && root.selectedEntry.partial); onClicked: toServerDialog.ask(root.selectedEntry) }
-                            // Only the manifest came: fetch the data again (the same as Add by CID).
+                            // Only the manifest came: fetch the data again (the same as Add by CID); one still
+                            // "arriving" is stopped first and started afresh.
                             LogosButton {
-                                visible: root.isStorage && !!root.selectedEntry && root.selectedEntry.partial === "missing"
+                                visible: root.isStorage && !!root.selectedEntry && !!root.selectedEntry.partial
                                 Layout.fillWidth: true
-                                text: "Fetch it again"
-                                onClicked: root.act("storageAdd", [root.selectedEntry.cid], "Fetching " + root.selectedEntry.name + " again")
+                                text: root.selectedEntry && root.selectedEntry.partial === "arriving" ? "Try again" : "Fetch it again"
+                                onClicked: root.refetch(root.selectedEntry)
                             }
                             LogosButton {
                                 visible: root.isStorage && !!root.storageNode
