@@ -2,14 +2,15 @@
   "name": "dufs_core",
   "display_name": "Dufs Core",
   "icon": "icon.png",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "core",
   "interface": "universal",
   "category": "tools",
-  "description": "Talks to dufs file servers over HTTP (list, upload, download, rename, delete, previews) and keeps files in Logos Storage",
+  "description": "Talks to dufs file servers over HTTP (list, upload, download, rename, delete, previews) and keeps files in Logos Storage, on this computer or on a node elsewhere",
   "main": "dufs_core_plugin",
   "dependencies": [
-    "storage_module"
+    "storage_module",
+    "storage_gateway"
   ],
   "nix": {
     "packages": {
@@ -20,7 +21,9 @@
     "cmake": {
       "find_packages": [],
       "extra_sources": [],
-      "extra_include_dirs": ["src"],
+      "extra_include_dirs": [
+        "src"
+      ],
       "extra_link_libraries": []
     }
   }

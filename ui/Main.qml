@@ -264,7 +264,14 @@ Item {
         var s = root.storage, n = (s.files || []).length
         if (s.state === "error") return s.error || "Not available"
         if (s.state === "starting" || s.state === "off") return "Starting…"
-        return n === 1 ? "1 file on this computer" : n + " files on this computer"
+        return (n === 1 ? "1 file " : n + " files ") + root.storageWhere
+    }
+    // Where the files are: this computer's node, or a node elsewhere (through storage_gateway).
+    readonly property string storageNode: root.storage.node || ""
+    readonly property string storageWhere: {
+        if (!root.storageNode) return "on this computer"
+        var m = /^http:\/\/(\[[^\]]+\]|[^\/:]+)/.exec(root.storageNode)
+        return "on the node at " + (m ? m[1] : root.storageNode)
     }
     function openStorage() {
         root.storageMode = true
@@ -746,7 +753,7 @@ Item {
                         Item { Layout.fillHeight: true }
                         Text { text: "Logos Storage"; color: root.cText; font.pixelSize: 14; font.bold: root.storageMode; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
                         Text {
-                            text: root.storage.state === "off" ? "Files by CID, on this computer" : root.storageLine
+                            text: root.storage.state === "off" ? "Files by CID, " + root.storageWhere : root.storageLine
                             color: root.storage.state === "error" ? root.cBad : root.cFaint; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText
                         }
                         Item { Layout.fillHeight: true }
@@ -1434,13 +1441,14 @@ Item {
                             checked: root.storage.advertise !== false
                             onToggled: { root.act("storageSettings", [JSON.stringify({ advertise: checked })]); checked = Qt.binding(function () { return root.storage.advertise !== false }) }
                             ToolTip.visible: hovered; ToolTip.delay: 500
-                            ToolTip.text: "Announce what you put into Storage, so others can fetch it by its CID. Off: it stays on this computer only."
+                            ToolTip.text: "Announce what you put into Storage, so others can fetch it by its CID. Off: it stays " + root.storageWhere + " only."
                         }
                         Text {
                             text: "Announce"; color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
                             Layout.leftMargin: -root.sp
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: announceBox.toggle(), announceBox.toggled() }
                         }
+                        LogosButton { Layout.preferredWidth: 80; Layout.preferredHeight: 34; text: "Node…"; onClicked: nodeDialog.open() }
                         LogosButton { Layout.preferredWidth: 110; Layout.preferredHeight: 34; text: "Add by CID"; onClicked: cidDialog.open() }
                         LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Upload"; onClicked: storageUploadDialog.open() }
                         LogosButton { Layout.preferredWidth: 44; Layout.preferredHeight: 34; text: "↻"; onClicked: root.act("storageRefresh", []) }
@@ -1543,8 +1551,10 @@ Item {
                     color: root.cFaint
                     font.pixelSize: 11
                     text: root.storage.advertise !== false
-                        ? "Anyone with a file's CID can fetch it from this computer while it is online and reachable, so Storage is public to whoever you give the CID. Keep private files on your dufs servers."
-                        : "Not announcing: what you put in now stays on this computer, and others can't fetch it."
+                        ? (root.storageNode
+                           ? "Anyone with a file's CID can fetch it from your node, which is always on, so Storage is public to whoever you give the CID. Keep private files on your dufs servers."
+                           : "Anyone with a file's CID can fetch it from this computer while it is online and reachable, so Storage is public to whoever you give the CID. Keep private files on your dufs servers.")
+                        : "Not announcing: what you put in now stays " + root.storageWhere + ", and others can't fetch it."
                 }
             }
 
@@ -1886,6 +1896,79 @@ Item {
         title: "Put into Logos Storage"
         fileMode: FileDialog.OpenFiles
         onAccepted: root.storeUrls(storageUploadDialog.selectedFiles)
+    }
+    Popup {
+        id: nodeDialog
+        anchors.centerIn: parent
+        width: 520
+        modal: true
+        padding: 20
+        onOpened: {
+            elsewhere.checked = !!root.storageNode
+            here.checked = !root.storageNode
+            nodeField.text = root.storageNode
+        }
+        function done() {
+            var url = elsewhere.checked ? nodeField.text.trim() : ""
+            if (elsewhere.checked && !url) return
+            if (url && url.indexOf("://") < 0) url = "http://" + url
+            close()
+            root.act("storageSettings", [JSON.stringify({ node: url })], url ? "Using the Storage node at " + url : "Using this computer's Storage node")
+        }
+        background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
+        contentItem: ColumnLayout {
+            spacing: 10
+            Text { text: "Storage node"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
+            Text {
+                text: "Where your Storage files live. A node on an always-on server with a public address serves them to others all the time; this computer's node only while it is on and reachable."
+                color: root.cSub; font.pixelSize: 13; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
+            }
+            component NodeChoice: Rectangle {
+                id: nc
+                property bool checked: false
+                property string label
+                signal picked()
+                Layout.fillWidth: true
+                Layout.preferredHeight: 40
+                radius: 8
+                color: nc.checked ? root.cRaised : "transparent"
+                border.width: 1
+                border.color: nc.checked ? root.cAccent : root.cLine
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 12
+                    spacing: 10
+                    Rectangle {
+                        width: 16; height: 16; radius: 8
+                        color: "transparent"; border.width: 2
+                        border.color: nc.checked ? root.cAccent : root.cSub
+                        Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: root.cAccent; visible: nc.checked }
+                    }
+                    Text { text: nc.label; color: root.cText; font.pixelSize: 13; textFormat: Text.PlainText; Layout.fillWidth: true }
+                }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: nc.picked() }
+            }
+            NodeChoice { id: here; label: "This computer"; onPicked: { here.checked = true; elsewhere.checked = false } }
+            NodeChoice { id: elsewhere; label: "A Storage node elsewhere"; onPicked: { elsewhere.checked = true; here.checked = false; nodeField.forceActiveFocus() } }
+            DField {
+                id: nodeField
+                enabled: elsewhere.checked
+                opacity: enabled ? 1 : 0.5
+                placeholderText: "http://[fd00::1]:8480"
+                onAccepted: nodeDialog.done()
+            }
+            Text {
+                visible: elsewhere.checked
+                text: "The node's REST API (logos-storage with --api-bindaddr). It has no password, so it must only be reachable over your VPN or mesh, never on a public address. Files go from this computer to the node and back."
+                color: root.cFaint; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                LogosButton { text: "Cancel"; onClicked: nodeDialog.close() }
+                LogosButton { text: "Use it"; onClicked: nodeDialog.done() }
+            }
+        }
     }
     Popup {
         id: cidDialog
