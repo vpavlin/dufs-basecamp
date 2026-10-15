@@ -74,8 +74,9 @@ public:
     // An empty serverId clears the whole recent list.
     std::string forgetRecent(const std::string& serverId, const std::string& path);
 
-    // ── Logos Storage: this computer's node (on Basecamp 0.3, the host's), shown as one more place
-    // beside the servers. Results arrive through snapshot().storage and the transfer list.
+    // ── Logos Storage: this computer's node (on Basecamp 0.3, the host's) and, optionally, one elsewhere
+    // (storage_gateway), each listed as a server ("logos-storage", "logos-storage-node"). The calls
+    // below act on the one being browsed (else this computer's). Results arrive through snapshot().
 
     // Starts using the node (once) and lists the files it holds.
     std::string storageRefresh();
@@ -87,11 +88,13 @@ public:
     std::string storageAdd(const std::string& cid);
     // Drops a file from this node.
     std::string storageRemove(const std::string& cid);
-    // A file on a dufs server into Storage.
-    std::string sendToStorage(const std::string& serverId, const std::string& path);
+    // A file on a dufs server into Storage: storageId "logos-storage" (this computer's node, also for "")
+    // or "logos-storage-node" (the node elsewhere).
+    std::string sendToStorage(const std::string& serverId, const std::string& path, const std::string& storageId);
     // A file in Storage onto a dufs server, into dir ("/a/b/").
     std::string saveToServer(const std::string& cid, const std::string& serverId, const std::string& dir);
-    // settingsJson: {"advertise": true} announces what is put into Storage, so others can fetch it by CID.
+    // settingsJson: {"advertise": true} announces what is put into Storage, so others can fetch it by CID;
+    // {"node": "http://…"} adds (or changes) the node elsewhere, "" removes it.
     std::string storageSettings(const std::string& settingsJson);
 
     // Opens an http(s) link in the system browser (the sandboxed view's Qt.openUrlExternally can't).

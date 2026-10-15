@@ -261,34 +261,41 @@ Item {
     readonly property var dufsServers: servers.filter(function (s) { return !s.storage })
     readonly property bool isStorage: !!root.currentServer && !!root.currentServer.storage
     readonly property var storage: st.storage || ({ state: "off", files: [] })
-    readonly property string storageLine: {
-        var s = root.storage, n = (s.files || []).length
-        if (s.state === "error") return s.error || "Not available"
-        if (s.state === "off") return "Files by CID, " + root.storageWhere
-        if (s.state === "starting") return "Starting…"
-        return (n === 1 ? "1 file " : n + " files ") + root.storageWhere
+    // A Storage row's second line: how many files and where, or what is wrong.
+    function storageLine(row) {
+        if (!row) return ""
+        var where = row.remote ? "on " + root.hostOf(row.url) : "on this computer"
+        if (row.state === "error") return row.stateError || "Not available"
+        if (row.state === "off") return "Files by CID, " + where
+        if (row.state === "starting") return "Starting…"
+        return (row.count === 1 ? "1 file " : row.count + " files ") + where
     }
-    // Where the files are: this computer's node, or a node elsewhere (through storage_gateway).
+    // The node elsewhere, when set (through storage_gateway).
     readonly property string storageNode: root.storage.node || ""
-    readonly property string storageWhere: {
-        if (!root.storageNode) return "on this computer"
-        var m = /^http:\/\/(\[[^\]]+\]|[^\/:]+)/.exec(root.storageNode)
-        return "on the node at " + (m ? m[1] : root.storageNode)
+    function hostOf(url) {
+        var m = /^http:\/\/(\[[^\]]+\]|[^\/:]+)/.exec(String(url || ""))
+        return m ? m[1] : String(url || "")
     }
     // "from pi5 · " / "added by CID · " before a CID, as the core recorded where a file came from.
     function storageOrigin(e) {
         if (!e || !e.from) return ""
         return (/^(added|by CID)/.test(e.from) ? e.from : "from " + e.from) + "  ·  "
     }
+    // To Logos Storage: straight to this computer's node, or, with a node elsewhere too, ask which.
     function sendToStorage(e) {
         if (!e || e.dir || !root.st.current) return
-        act("sendToStorage", [root.st.current, e.path], "Sending " + e.name + " to Logos Storage")
+        if (root.storageNode) storageTargetMenu.popupFor(e)
+        else sendToStorageNode(e, "logos-storage")
+    }
+    function sendToStorageNode(e, storageId) {
+        act("sendToStorage", [root.st.current, e.path, storageId],
+            "Sending " + e.name + (storageId === "logos-storage" ? " to Logos Storage" : " to the Storage node"))
     }
     readonly property var currentServer: {
         for (var i = 0; i < servers.length; i++) if (servers[i].id === st.current) return servers[i]
         return null
     }
-    readonly property bool anyActive: !!st.loading || activeTransfers > 0 || pendingPreviews > 0 || root.storage.state === "starting"
+    readonly property bool anyActive: !!st.loading || activeTransfers > 0 || pendingPreviews > 0 || root.servers.some(function (s) { return s.storage && s.state === "starting" })
     readonly property int activeTransfers: {
         var n = 0, t = st.transfers || []
         for (var i = 0; i < t.length; i++) if (t[i].state === "running" || t[i].state === "queued") n++
@@ -437,7 +444,7 @@ Item {
     }
     // A pinned/recent place's label: its name; a file in Storage ("/<cid>") by the file's name.
     function placeName(pl) {
-        if (pl && pl.server === "logos-storage") {
+        if (pl && String(pl.server).indexOf("logos-storage") === 0) {
             var cid = String(pl.path).replace(/^\//, ""), f = root.storage.files || []
             for (var i = 0; i < f.length; i++) if (f[i].cid === cid) return f[i].name
             return cid.length > 14 ? cid.substring(0, 6) + "…" + cid.substring(cid.length - 6) : cid
@@ -737,8 +744,8 @@ Item {
                             Item { Layout.fillHeight: true }
                             Text { text: modelData.name; color: root.cText; font.pixelSize: 14; font.bold: active; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
                             Text {
-                                text: modelData.storage ? root.storageLine : modelData.url.replace(/^https?:\/\//, "") + (modelData.user ? "  ·  " + modelData.user : "")
-                                color: modelData.storage && root.storage.state === "error" ? root.cBad : root.cFaint
+                                text: modelData.storage ? root.storageLine(modelData) : modelData.url.replace(/^https?:\/\//, "") + (modelData.user ? "  ·  " + modelData.user : "")
+                                color: modelData.storage && modelData.state === "error" ? root.cBad : root.cFaint
                                 font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText
                             }
                             Item { Layout.fillHeight: true }
@@ -832,7 +839,7 @@ Item {
                                         if (!pRow.pl) return ""
                                         var p = pRow.pl.path.replace(/\/$/, "")
                                         var dir = p.substring(0, p.lastIndexOf("/") + 1) || "/"
-                                        if (pRow.pl.server === "logos-storage") return "Logos Storage"
+                                        if (String(pRow.pl.server).indexOf("logos-storage") === 0) return root.serverName(pRow.pl.server)
                                         return (root.dufsServers.length > 1 ? root.serverName(pRow.pl.server) + "  ·  " : "") + dir
                                     }
                                     color: root.cFaint; font.pixelSize: 10; elide: Text.ElideLeft; Layout.fillWidth: true; textFormat: Text.PlainText
@@ -1214,7 +1221,7 @@ Item {
                             font.pixelSize: 13
                             text: !root.coreSeen ? (root.missedPolls > 3 ? "No answer yet. Make sure the Dufs Core module is installed." : "")
                                 : !root.currentServer ? "For example http://pi5.lan:5000. Start dufs with -A to allow uploads, deletes and search."
-                                : root.st.error ? (root.isStorage ? "Basecamp starts Storage a moment after it opens; with a node elsewhere, check its address (⋯ beside Logos Storage)." : root.currentServer ? root.currentServer.url : "")
+                                : root.st.error ? (root.isStorage ? (root.currentServer.remote ? "Check the node's address and that it is reachable over your VPN or mesh (⋯ beside it)." : "Basecamp starts Storage a moment after it opens; if this stays, check that the Storage module is installed.") : root.currentServer ? root.currentServer.url : "")
                                 : root.st.query ? ""
                                 : root.isStorage ? "Drop files here, upload them, send a file from a dufs server (its ⋯ menu), or add one someone shared by its CID."
                                 : (root.st.perms.upload !== false ? "Drop files here to upload them." : "")
@@ -1420,7 +1427,7 @@ Item {
                             LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
                             LogosButton { Layout.fillWidth: true; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
                             LogosButton { Layout.fillWidth: true; text: !!root.selectedEntry && root.isPinned(root.selectedEntry.path) ? "Unpin" : "Pin"; onClicked: root.togglePin(root.selectedEntry.path) }
-                            LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "To Logos Storage"; onClicked: root.sendToStorage(root.selectedEntry) }
+                            LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: root.storageNode ? "To Logos Storage…" : "To Logos Storage"; onClicked: root.sendToStorage(root.selectedEntry) }
                         }
                     }
                 }
@@ -1517,7 +1524,7 @@ Item {
         MenuItem { visible: root.isStorage; height: visible ? implicitHeight : 0; text: "Copy CID"; onTriggered: root.copyText(entryMenu.entry.cid) }
         MenuItem { text: entryMenu.entry && root.isPinned(entryMenu.entry.path) ? "Unpin" : "Pin"; onTriggered: root.togglePin(entryMenu.entry.path) }
         MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
-        MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Send to Logos Storage"; enabled: !!entryMenu.entry && !entryMenu.entry.dir; onTriggered: root.sendToStorage(entryMenu.entry) }
+        MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: root.storageNode ? "Send to Logos Storage…" : "Send to Logos Storage"; enabled: !!entryMenu.entry && !entryMenu.entry.dir; onTriggered: root.sendToStorage(entryMenu.entry) }
         MenuItem { visible: root.isStorage; height: visible ? implicitHeight : 0; text: "Save to a dufs server…"; enabled: root.dufsServers.length > 0; onTriggered: toServerDialog.ask(entryMenu.entry) }
         MenuSeparator {}
         MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }
@@ -1755,68 +1762,52 @@ Item {
     Popup {
         id: nodeDialog
         anchors.centerIn: parent
-        width: 520
+        width: 540
         modal: true
         padding: 20
         onOpened: {
-            elsewhere.checked = !!root.storageNode
-            here.checked = !root.storageNode
+            useNode.checked = !!root.storageNode
             nodeField.text = root.storageNode
             announceBox.checked = root.storage.advertise !== false
         }
         function done() {
-            var url = elsewhere.checked ? nodeField.text.trim() : ""
-            if (elsewhere.checked && !url) return
+            var url = useNode.checked ? nodeField.text.trim() : ""
+            if (useNode.checked && !url) { nodeField.forceActiveFocus(); return }
             if (url && url.indexOf("://") < 0) url = "http://" + url
             close()
             var changedNode = url !== root.storageNode
             root.act("storageSettings", [JSON.stringify({ node: url, advertise: announceBox.checked })],
-                     changedNode ? (url ? "Using the Storage node at " + url : "Using this computer's Storage node") : "Saved")
+                     !changedNode ? "Saved" : url ? "Added the Storage node at " + url : "Removed the Storage node")
         }
         background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
         contentItem: ColumnLayout {
             spacing: 10
             Text { text: "Logos Storage"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
             Text {
-                text: "Where your Storage files live. A node on an always-on server with a public address serves them to others all the time; this computer's node only while it is on and reachable."
+                text: "This computer's node is always there: it serves your files while this computer is on and reachable. A node on an always-on server with a public address serves them all the time; add one and it shows as a second Storage beside this computer's."
                 color: root.cSub; font.pixelSize: 13; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
             }
-            component NodeChoice: Rectangle {
-                id: nc
-                property bool checked: false
-                property string label
-                signal picked()
+            RowLayout {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 40
-                radius: 8
-                color: nc.checked ? root.cRaised : "transparent"
-                border.width: 1
-                border.color: nc.checked ? root.cAccent : root.cLine
-                RowLayout {
-                    anchors.fill: parent
-                    anchors.leftMargin: 12
-                    spacing: 10
-                    Rectangle {
-                        width: 16; height: 16; radius: 8
-                        color: "transparent"; border.width: 2
-                        border.color: nc.checked ? root.cAccent : root.cSub
-                        Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: root.cAccent; visible: nc.checked }
-                    }
-                    Text { text: nc.label; color: root.cText; font.pixelSize: 13; textFormat: Text.PlainText; Layout.fillWidth: true }
+                Layout.topMargin: 4
+                spacing: 6
+                CheckBox { id: useNode }
+                Text {
+                    Layout.fillWidth: true
+                    text: "Also use a Storage node elsewhere"
+                    color: root.cText; font.pixelSize: 13; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { useNode.toggle(); if (useNode.checked) nodeField.forceActiveFocus() } }
                 }
-                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: nc.picked() }
             }
-            NodeChoice { id: here; label: "This computer"; onPicked: { here.checked = true; elsewhere.checked = false } }
-            NodeChoice { id: elsewhere; label: "A Storage node elsewhere"; onPicked: { elsewhere.checked = true; here.checked = false; nodeField.forceActiveFocus() } }
             DField {
                 id: nodeField
-                enabled: elsewhere.checked
+                enabled: useNode.checked
                 opacity: enabled ? 1 : 0.5
                 placeholderText: "http://[fd00::1]:8480"
                 onAccepted: nodeDialog.done()
             }
             Text {
-                visible: elsewhere.checked
+                visible: useNode.checked
                 text: "The node's REST API (logos-storage with --api-bindaddr). It has no password, so it must only be reachable over your VPN or mesh, never on a public address. Files go from this computer to the node and back."
                 color: root.cFaint; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
             }
@@ -1834,7 +1825,7 @@ Item {
             }
             Text {
                 text: announceBox.checked
-                    ? "Anyone with a file's CID can fetch it from the node while it is online and reachable, so Storage is public to whoever you give the CID. Keep private files on your dufs servers."
+                    ? "Anyone with a file's CID can fetch it from a node holding it while that node is online and reachable, so Storage is public to whoever you give the CID. Keep private files on your dufs servers."
                     : "Not announcing: what you put in from now on stays on the node, and others can't fetch it."
                 color: root.cFaint; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
             }
@@ -1842,9 +1833,18 @@ Item {
                 Layout.fillWidth: true
                 Item { Layout.fillWidth: true }
                 LogosButton { text: "Cancel"; onClicked: nodeDialog.close() }
-                LogosButton { text: "Use it"; onClicked: nodeDialog.done() }
+                LogosButton { text: "Save"; onClicked: nodeDialog.done() }
             }
         }
+    }
+    // Two Storage nodes: which one a file from a dufs server goes to.
+    Menu {
+        id: storageTargetMenu
+        width: 380
+        property var entry: null
+        function popupFor(e) { entry = e; popup() }
+        MenuItem { text: "To this computer's Storage"; onTriggered: root.sendToStorageNode(storageTargetMenu.entry, "logos-storage") }
+        MenuItem { text: "To the Storage node (" + root.hostOf(root.storageNode) + ")"; onTriggered: root.sendToStorageNode(storageTargetMenu.entry, "logos-storage-node") }
     }
     Popup {
         id: cidDialog

@@ -13,7 +13,7 @@ Browse, preview, upload and download files on your [dufs](https://github.com/sig
 - **Links into Dufs**: "Copy Basecamp link" gives `basecamp://intent/dufs.open?p=…`, which opens that file (or folder) in Dufs from another app, a note or a browser. Other apps can also ask for it directly with the `dufs.open` intent, `{ "url": "http://pi5.lan:5000/docs/notes.md" }`; the server must be one you added to Dufs. To open one by hand, press **Go to…** (or Ctrl+L) and paste a file's address or a Basecamp link.
 - **Pinned and Recent**: pin a file or folder from its menu, the preview panel, or the ☆ in the toolbar (the folder you are in); they stay in the sidebar under the servers. Files you open show up under Recent (the last 12). Both are kept per server, in the same file as the server list.
 - **Logins**: servers started with `--auth` take a user name and password
-- **Logos Storage**: "Logos Storage" sits in the server list and browses like a server: the same list and grid, search, previews of images, text and markdown in the side panel, upload (or drop files), download, delete and pin. Each file shows where it came from and its CID ("Copy CID"). A file on a dufs server goes there with "To Logos Storage"; a file in Storage goes to a server with "To a dufs server…"; "Add by CID" fetches one someone shared. Storage has no folders, and a file can't be renamed (its name is part of its CID). ⋯ beside it picks the node (this computer's, or one elsewhere) and whether to announce.
+- **Logos Storage**: "Logos Storage" sits in the server list and browses like a server: the same list and grid, search, previews of images, text and markdown in the side panel, upload (or drop files), download, delete and pin. Each file shows where it came from and its CID ("Copy CID"). A file on a dufs server goes there with "To Logos Storage"; a file in Storage goes to a server with "To a dufs server…"; "Add by CID" fetches one someone shared. Storage has no folders, and a file can't be renamed (its name is part of its CID). ⋯ beside it sets whether to announce and adds a node elsewhere, which then shows as a second Storage ("Storage node") beside this computer's; "To Logos Storage…" then asks which one.
 
 What a server allows depends on how dufs runs: `dufs -A /data` allows everything (upload, delete, search, archive); without the `--allow-*` flags the buttons are disabled and the view says why.
 
@@ -34,7 +34,7 @@ Content in Storage is addressed by CID, and with "Announce" on (the default) any
 
 #### A Storage node elsewhere
 
-"Node…" in the Storage pane switches from this computer's node to one on a server, for example
+⋯ beside Logos Storage adds a node on a server, listed as "Storage node" next to this computer's own, for example
 an always-on VPS with a public address that serves your files to the network while your laptop
 sleeps. Dufs then talks to that node through
 [`storage_gateway`](https://github.com/vpavlin/logos-storage-gateway). It has the same API as

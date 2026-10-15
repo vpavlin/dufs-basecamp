@@ -2,7 +2,7 @@
   "name": "dufs_core",
   "display_name": "Dufs Core",
   "icon": "icon.png",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "core",
   "interface": "universal",
   "category": "tools",
