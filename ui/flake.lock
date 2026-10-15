@@ -554,18 +554,18 @@
       },
       "locked": {
         "dir": "core",
-        "lastModified": 1792048652,
-        "narHash": "sha256-JJevYD/OryG8pgtccEtzWSW1wuCqRyVXRFlK/sg/RQk=",
+        "lastModified": 1792050889,
+        "narHash": "sha256-UJHfUFhQMrdYlOUhOu4pFfL9TnKPubni1MH0ipAePZg=",
         "owner": "vpavlin",
         "repo": "dufs-basecamp",
-        "rev": "5dff57d68f33dc3b7a496736a6fa57e0cbd261f7",
+        "rev": "afe5ee07a53e8a95dfa9b38454701e26bdf1756e",
         "type": "github"
       },
       "original": {
         "dir": "core",
         "owner": "vpavlin",
         "repo": "dufs-basecamp",
-        "rev": "5dff57d68f33dc3b7a496736a6fa57e0cbd261f7",
+        "rev": "afe5ee07a53e8a95dfa9b38454701e26bdf1756e",
         "type": "github"
       }
     },
