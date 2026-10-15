@@ -50,6 +50,8 @@ static const size_t kMaxRecent = 12;
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
 static const int kMaxPreviewJobs = 3;
+// Listing a node's files: it can be slow while the node is busy (a download looking for its holders).
+static const int kStorageListMs = 45000;
 // Logos Storage shows as one more server, with this id. Its "paths" are "/<cid>".
 static const char* kStorageId = "logos-storage";
 static const char* kStorageNodeId = "logos-storage-node";
@@ -328,6 +330,7 @@ struct DufsCorePrivate {
         // CIDs this node has only the manifest of: an "add" still arriving, or one that never came.
         // Storage lists a dataset once its manifest is in, before (and without) its data.
         std::set<std::string> incomplete;
+        bool relistArmed = false;            // a refresh failed after a good listing: one more is due
     };
     StNode nodes[2];
     bool stPollArmed = false, stAdvertise = true;
@@ -918,7 +921,7 @@ struct DufsCorePrivate {
                 if (arr.is_string()) arr = json::parse(arr.get<std::string>(), nullptr, false);
             }
             onLoop([this, n, arr, err] { gotManifests(n, arr, err); });
-        }, kStorageCallMs); });
+        }, kStorageListMs); });
         changed();
     }
     // A Storage "server"'s listing: its files as entries like a dufs folder's, at "/<cid>", with the
@@ -951,6 +954,16 @@ struct DufsCorePrivate {
     {
         StNode& N = nodes[n];
         N.listing = false;
+        // A node that has listed its files before keeps them when one refresh is slow or fails (it is
+        // busy with a download, or the network hiccuped): no error over a good list, another look soon.
+        if (!err.empty() && N.state == "ready") {
+            if (!N.relistArmed) {
+                N.relistArmed = true;
+                QTimer::singleShot(5000, loop, guarded("relist", [this, n] { nodes[n].relistArmed = false; listStorage(n); }));
+            }
+            changed();
+            return;
+        }
         if (!err.empty()) {
             // Not started yet (the host starts it a moment after Basecamp opens): say so and look again.
             N.state = "error"; N.error = err;
