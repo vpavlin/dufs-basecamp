@@ -45,7 +45,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.2.4";
+static const char* kVersion = "0.2.5";
 static const size_t kMaxRecent = 12;
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
@@ -336,6 +336,8 @@ struct DufsCorePrivate {
     // Previews of files in Storage: "<node>|<cid>" downloading into the cache -> which preview it is for.
     struct StoragePreview { std::string path, part, target; qint64 size = 0, started = 0; bool image = false; int node = 0; };
     std::map<std::string, StoragePreview> stPreviewWait;
+    // "<node>|<cid>" -> transfers waiting for that CID's manifest before their download starts.
+    std::map<std::string, std::vector<std::string>> stManifestWait;
 
     explicit DufsCorePrivate(DufsCoreImpl* qq) : q(qq), loop(new QObject()) {}
     ~DufsCorePrivate() { delete loop; }
@@ -844,6 +846,10 @@ struct DufsCorePrivate {
                 sm.onStorageDownloadDone([this, n](const std::string& p) { onLoop([this, n, p] { downloadDone(n, json::parse(p, nullptr, false)); }); });
                 sm.onStorageUploadProgress([this, n](const std::string& p) { onLoop([this, n, p] { progress(n, json::parse(p, nullptr, false)); }); });
                 sm.onStorageDownloadProgress([this, n](const std::string& p) { onLoop([this, n, p] { progress(n, json::parse(p, nullptr, false)); }); });
+                sm.onStorageDownloadManifestDone([this, n](const std::string& p) { onLoop([this, n, p] {
+                    json j = json::parse(p, nullptr, false);
+                    manifestDone(n, jstr(j, "cid", ""), jbool(j, "success", false), jstr(j, "error", ""));
+                }); });
                 sm.onStorageRemoveDone([this, n](const std::string& p) { onLoop([this, n, p] {
                     json j = json::parse(p, nullptr, false);
                     if (!jbool(j, "success", true)) note("Could not remove it from Storage: " + jstr(j, "error", "unknown error"), "error");
@@ -1102,6 +1108,52 @@ struct DufsCorePrivate {
         t->started = QDateTime::currentMSecsSinceEpoch();
         if (t->kind == "add" && nodes[n].incomplete.insert(cid).second) saveStorage();
         linkNodes();
+        // storage_module looks the manifest up INSIDE downloadToUrl, before it returns, and serves one
+        // call at a time: a CID nobody answers for would hold every later call (an upload) until the
+        // lookup gave up. So the manifest first, with the call that does not block (downloadManifest,
+        // done in an event), and the download once it is here. A manifest the node has: straight on.
+        if (!nodes[n].size.count(cid)) {
+            // Not on this node yet: listed once its manifest is in, whole once the download ends.
+            if (nodes[n].incomplete.insert(cid).second) saveStorage();
+            const std::string key = sessKey(n, cid);
+            auto& waiting = stManifestWait[key];
+            waiting.push_back(id);
+            if (waiting.size() > 1) { changed(); return; }
+            withStorage(n, [&](auto& sm) { sm.downloadManifestAsyncResult(cid, false, false, [this, n, cid](logos::AsyncResult<StdLogosResult> ar) {
+                const bool sent = ar.ok() && ar.value.success;
+                const std::string err = !ar.ok() ? std::string() : ar.value.error;
+                onLoop([this, n, cid, sent, err] { if (!sent && !err.empty()) manifestDone(n, cid, false, err); });
+            }, kStorageCallMs); });
+            // No event (one host build lost them): give up on the lookup after a while.
+            QTimer::singleShot(kStorageFetchMs + 30000, loop, guarded("manifest wait", [this, n, cid] {
+                if (stManifestWait.count(sessKey(n, cid))) manifestDone(n, cid, false, "");
+            }));
+            changed();
+            return;
+        }
+        beginStorageDownload(id);
+    }
+    // The manifest is here (or never came): the waiting transfers start their download (or fail).
+    void manifestDone(int n, const std::string& cid, bool ok, const std::string& err)
+    {
+        auto it = stManifestWait.find(sessKey(n, cid));
+        if (it == stManifestWait.end()) return;
+        std::vector<std::string> ids = it->second;
+        stManifestWait.erase(it);
+        for (auto& id : ids) {
+            Transfer* t = transfer(id);
+            if (!t || t->state != "running") continue;
+            if (ok) beginStorageDownload(id);
+            else retryOrFail(*t, downloadError(err));
+        }
+        changed();
+    }
+    void beginStorageDownload(const std::string& id)
+    {
+        Transfer* t = transfer(id);
+        if (!t) return;
+        const int n = t->node;
+        const std::string cid = t->cid, path = t->storagePath;
         // local=false: from the network when this node lacks it. isPrivate=false. advertise=false while it
         // downloads: else the node announces itself as a holder before it has the data, and leaves a dead
         // provider in the DHT when the download fails. Announced once whole (fetched()).
