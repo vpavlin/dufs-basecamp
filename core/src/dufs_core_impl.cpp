@@ -45,7 +45,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.2.3";
+static const char* kVersion = "0.2.4";
 static const size_t kMaxRecent = 12;
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
@@ -269,6 +269,9 @@ struct Transfer {
     qint64 started = 0;
     int tries = 0;
     int node = 0;                            // which Storage node (kLocal / kRemote)
+    int copyTo = -1;                         // "copy": the node it goes to, once read from `node`
+    bool copyUp = false;                     // "copy", second half: uploading into copyTo
+    bool uploading() const { return kind == "store" || kind == "promote" || (kind == "copy" && copyUp); }
 };
 
 // Where a file in Storage came from (Storage itself keeps only its name).
@@ -320,6 +323,11 @@ struct DufsCorePrivate {
         json files = json::array();
         std::map<std::string, std::vector<std::string>> byName;
         std::map<std::string, int64_t> size;
+        std::string peerId;                  // the node's own peer ID and dialable addresses (debug())
+        json addrs = json::array();
+        // CIDs this node has only the manifest of: an "add" still arriving, or one that never came.
+        // Storage lists a dataset once its manifest is in, before (and without) its data.
+        std::set<std::string> incomplete;
     };
     StNode nodes[2];
     bool stPollArmed = false, stAdvertise = true;
@@ -779,6 +787,13 @@ struct DufsCorePrivate {
         json j = readJsonFile(storageFile());
         stAdvertise = jbool(j, "advertise", true);
         nodes[kRemote].url = jstr(j, "node", "");
+        // Manifest-only CIDs per node ("0" this computer's, "1" the node elsewhere).
+        if (j.is_object() && j.contains("incomplete") && j["incomplete"].is_object())
+            for (int n : {kLocal, kRemote}) {
+                const std::string k = std::to_string(n);
+                if (j["incomplete"].contains(k) && j["incomplete"][k].is_array())
+                    for (auto& c : j["incomplete"][k]) if (c.is_string()) nodes[n].incomplete.insert(c.get<std::string>());
+            }
         auto it = j.is_object() ? j.find("files") : j.end();
         if (it == j.end() || !it->is_object()) return;
         for (auto& [cid, m] : it->items())
@@ -788,7 +803,9 @@ struct DufsCorePrivate {
     {
         json files = json::object();
         for (auto& [cid, m] : stIndex) files[cid] = {{"name", m.name}, {"from", m.from}, {"at", m.at}};
-        writeJsonFile(storageFile(), {{"advertise", stAdvertise}, {"node", nodes[kRemote].url}, {"files", files}});
+        json inc = json::object();
+        for (int n : {kLocal, kRemote}) inc[std::to_string(n)] = std::vector<std::string>(nodes[n].incomplete.begin(), nodes[n].incomplete.end());
+        writeJsonFile(storageFile(), {{"advertise", stAdvertise}, {"node", nodes[kRemote].url}, {"incomplete", inc}, {"files", files}});
     }
 
     // Two Storage nodes, each listed as a "server": this computer's (storage_module, the host's node)
@@ -917,7 +934,9 @@ struct DufsCorePrivate {
             out.push_back({{"name", name}, {"rel", name}, {"path", "/" + cid}, {"dir", false},
                            {"kind", kindOf(name, false)}, {"size", jnum(f, "size", 0)},
                            {"mtime", jnum(f, "at", 0)}, {"url", ""}, {"cid", cid},
-                           {"from", jstr(f, "from", "")}, {"mime", jstr(f, "mime", "")}});
+                           {"from", jstr(f, "from", "")}, {"mime", jstr(f, "mime", "")},
+                           // "arriving" (an add still running) or "missing" (only the manifest came)
+                           {"partial", !N.incomplete.count(cid) ? "" : storageBusy(cid) ? "arriving" : "missing"}});
         }
         entries = out;
     }
@@ -960,9 +979,41 @@ struct DufsCorePrivate {
             return lower(a["name"].get<std::string>()) < lower(b["name"].get<std::string>());
         });
         N.files = files;
+        if (N.peerId.empty()) learnPeer(n);
         storageEntries();
         pollStorage();
         changed();
+    }
+
+    // The node's peer ID and addresses, for linking the two nodes.
+    void learnPeer(int n)
+    {
+        withStorage(n, [&](auto& sm) { sm.debugAsyncResult([this, n](logos::AsyncResult<StdLogosResult> ar) {
+            if (!ar.ok() || !ar.value.success) return;
+            json v = ar.value.value;
+            if (v.is_string()) v = json::parse(v.get<std::string>(), nullptr, false);
+            if (!v.is_object()) return;
+            const std::string id = jstr(v, "id", "");
+            json addrs = json::array();
+            // Direct addresses only: not relay circuits or Mix routes, which this node can't dial.
+            if (v.contains("addrs") && v["addrs"].is_array())
+                for (auto& a : v["addrs"])
+                    if (a.is_string() && a.get<std::string>().find("p2p-circuit") == std::string::npos
+                        && a.get<std::string>().find("mix") == std::string::npos) addrs.push_back(a);
+            onLoop([this, n, id, addrs] { nodes[n].peerId = id; nodes[n].addrs = addrs; linkNodes(); });
+        }, kStorageCallMs); });
+    }
+    // With a node elsewhere too: this computer's node dials it directly. A node behind NAT can't be
+    // dialled, and a holder found only through the DHT is often ignored (libstorage's download swarm,
+    // fixed in logos-storage-nim #1540): a direct connection lets either fetch from the other.
+    void linkNodes()
+    {
+        const StNode& R = nodes[kRemote];
+        if (R.url.empty() || R.peerId.empty() || R.addrs.empty() || !nodes[kLocal].init) return;
+        std::vector<std::string> addrs;
+        for (auto& a : R.addrs) addrs.push_back(a.get<std::string>());
+        const std::string peer = R.peerId;
+        withStorage(kLocal, [&](auto& sm) { sm.connectAsyncResult(peer, addrs, [](logos::AsyncResult<StdLogosResult>) {}, kStorageCallMs); });
     }
 
     // ── storage transfers
@@ -970,6 +1021,7 @@ struct DufsCorePrivate {
     //   fetch    Storage -> a file on this computer (and, with no file wanted, "add": just held there)
     //   promote  a dufs server -> Storage   (HTTP into a temp file, then upload)
     //   demote   Storage -> a dufs server   (download into a temp file, then HTTP PUT)
+    //   copy     one Storage node -> the other, through this computer (download, then upload)
     // Each runs against one node (Transfer::node).
     Transfer& newStorageTransfer(int n, const std::string& kind, const std::string& name)
     {
@@ -989,6 +1041,7 @@ struct DufsCorePrivate {
         if (!t.session.empty()) stSessions.erase(sessKey(t.node, t.session));
         if (t.file) { t.file->close(); delete t.file; t.file = nullptr; }
         cleanTmp(t);
+        storageEntries();
         changed();
     }
     void cleanTmp(Transfer& t)
@@ -1047,6 +1100,8 @@ struct DufsCorePrivate {
         fs::remove(path, ec);
         t->storagePath = path;
         t->started = QDateTime::currentMSecsSinceEpoch();
+        if (t->kind == "add" && nodes[n].incomplete.insert(cid).second) saveStorage();
+        linkNodes();
         // local=false: from the network when this node lacks it. isPrivate=false. advertise=false while it
         // downloads: else the node announces itself as a holder before it has the data, and leaves a dead
         // provider in the DHT when the download fails. Announced once whole (fetched()).
@@ -1117,7 +1172,8 @@ struct DufsCorePrivate {
         t.cid = cid;
         t.state = "done";
         t.done = t.total;
-        stIndex[cid] = StoredMeta{t.uploadName, t.from, QDateTime::currentMSecsSinceEpoch()};
+        // A copy keeps where the file first came from.
+        if (t.kind != "copy" || !stIndex.count(cid)) stIndex[cid] = StoredMeta{t.uploadName, t.from, QDateTime::currentMSecsSinceEpoch()};
         saveStorage();
         cleanTmp(t);
         note("In " + nodeName(t.node) + ": " + t.name, "ok");
@@ -1148,7 +1204,18 @@ struct DufsCorePrivate {
             const std::string cid = t.cid;
             withStorage(t.node, [&](auto& sm) { sm.setAdvertiseAsyncResult(cid, true, [](logos::AsyncResult<StdLogosResult>) {}, kStorageCallMs); });
         }
+        if (nodes[t.node].incomplete.erase(t.cid)) saveStorage();
         if (t.kind == "demote") { putToServer(t); return; }
+        if (t.kind == "copy") {
+            // Read from the one node: now into the other, under the same name (so the same CID).
+            const std::string id = t.id;
+            t.node = t.copyTo;
+            t.copyUp = true;
+            t.session.clear();
+            t.from = "copied from " + (t.copyTo == kLocal ? std::string("the Storage node") : std::string("this computer's Storage"));
+            storeFile(id, t.tmp);
+            return;
+        }
         if (t.kind == "add") {
             // Only held by the node: the file written here was the way to know it arrived.
             cleanTmp(t);
@@ -1190,7 +1257,7 @@ struct DufsCorePrivate {
             if (t.state != "running" || t.phase != "storage") continue;
             pending = true;
             StNode& N = nodes[t.node];
-            if (t.kind == "store" || t.kind == "promote") {
+            if (t.uploading()) {
                 auto it = N.byName.find(t.uploadName);
                 std::string cid;
                 if (it != N.byName.end())
@@ -1781,7 +1848,7 @@ std::string DufsCoreImpl::cancelTransfer(const std::string& id)
         if (!t->session.empty()) {
             const std::string sess = t->session;
             d->stSessions.erase(DufsCorePrivate::sessKey(t->node, sess));
-            const bool upload = t->kind == "store" || t->kind == "promote";
+            const bool upload = t->uploading();
             if (t->phase == "storage")
                 d->withStorage(t->node, [&](auto& sm) {
                     if (upload) sm.uploadCancelAsyncResult(sess, [](logos::AsyncResult<StdLogosResult>) {}, kStorageCallMs);
@@ -1790,6 +1857,39 @@ std::string DufsCoreImpl::cancelTransfer(const std::string& id)
         }
         if (t->phase != "http") { std::error_code ec; if (!t->storagePath.empty() && t->kind == "fetch") fs::remove(t->storagePath, ec); d->cleanTmp(*t); }
     }
+    d->storageEntries();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::retryTransfer(const std::string& id)
+{
+    Transfer* t = d->transfer(id);
+    if (!t) return json({{"ok", false}, {"error", "No such transfer."}}).dump();
+    if (t->state != "failed" && t->state != "cancelled") return json({{"ok", false}, {"error", "It is still running."}}).dump();
+    if (t->reply) return json({{"ok", false}, {"error", "It is still stopping; try again in a moment."}}).dump();
+    // From the start: the same file, the same target, a fresh attempt.
+    t->state = "running";
+    t->error.clear();
+    t->done = 0;
+    t->tries = 0;
+    t->session.clear();
+    t->started = QDateTime::currentMSecsSinceEpoch();
+    const std::string tid = t->id;
+    if (t->kind == "upload") { t->state = "queued"; d->pumpUploads(); }
+    else if (t->kind == "download") d->startDownload(*t, !t->path.empty() && t->path.back() == '/');
+    else if (t->kind == "store") { d->ensureStorage(t->node); d->storeFile(tid, t->local); }
+    else if (t->kind == "promote") { d->ensureStorage(t->node); d->startPromote(*t); }
+    else if (t->kind == "fetch") { d->ensureStorage(t->node); d->fetchFile(tid, t->cid, t->local + ".part"); }
+    else if (t->kind == "add" || t->kind == "demote" || t->kind == "copy") {
+        if (t->kind == "copy" && t->copyUp) { t->node = t->copyTo == kLocal ? kRemote : kLocal; t->copyUp = false; }
+        if (t->kind == "add") t->tmp = d->storageTmp(tid) + "/data";
+        ensurePrivateDir(d->storageTmp(tid));
+        d->ensureStorage(t->node);
+        if (t->kind == "copy") d->ensureStorage(t->copyTo);
+        d->fetchFile(tid, t->cid, t->tmp);
+    } else { t->state = "failed"; t->error = "This kind of transfer can't be retried."; }
+    d->storageEntries();
     d->changed();
     return d->state().dump();
 }
@@ -2005,6 +2105,31 @@ std::string DufsCoreImpl::storageAdd(const std::string& cidIn)
     return d->state().dump();
 }
 
+std::string DufsCoreImpl::storageCopy(const std::string& cidIn, const std::string& toStorageId)
+{
+    const std::string cid = cleanCid(cidIn);
+    if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID."}}).dump();
+    const int from = d->activeNode(), to = d->nodeOfServer(toStorageId);
+    if (to < 0) return json({{"ok", false}, {"error", "No such Storage node."}}).dump();
+    if (to == from) return json({{"ok", false}, {"error", "It is already there."}}).dump();
+    if (d->nodes[from].incomplete.count(cid)) return json({{"ok", false}, {"error", "Its data hasn't arrived here yet."}}).dump();
+    if (d->storageBusy(cid)) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    std::string name = cid;
+    for (auto& f : d->nodes[from].files) if (jstr(f, "cid", "") == cid && !jstr(f, "name", "").empty()) name = jstr(f, "name", "");
+    if (name.find('/') != std::string::npos) name = baseName(name);
+    d->ensureStorage(from);
+    d->ensureStorage(to);
+    // Through this computer: read from the one node into a temp file under the file's name (the CID
+    // includes it), then upload that into the other. No peer-to-peer path between the nodes needed.
+    Transfer& t = d->newStorageTransfer(from, "copy", name);
+    t.copyTo = to;
+    const std::string id = t.id;
+    ensurePrivateDir(d->storageTmp(id));
+    t.tmp = d->storageTmp(id) + "/" + name;
+    d->fetchFile(id, cid, t.tmp);
+    return d->state().dump();
+}
+
 std::string DufsCoreImpl::storageRemove(const std::string& cidIn)
 {
     const std::string cid = cleanCid(cidIn);
@@ -2016,6 +2141,7 @@ std::string DufsCoreImpl::storageRemove(const std::string& cidIn)
         const std::string err = !ar.ok() ? "Logos Storage did not answer." : ar.value.error;
         d->onLoop([this, ok, err, cid, n] {
             if (!ok) { d->note("Could not remove it from Storage: " + err, "error"); d->changed(); return; }
+            if (d->nodes[n].incomplete.erase(cid)) d->saveStorage();
             d->note("Removed from " + d->nodeName(n), "ok");
             d->listStorage(n);
         });
@@ -2087,6 +2213,9 @@ std::string DufsCoreImpl::storageSettings(const std::string& settingsJson)
             R.files = json::array();
             R.byName.clear();
             R.size.clear();
+            R.incomplete.clear();
+            R.peerId.clear();
+            R.addrs = json::array();
             d->saveStorage();
             if (!node.empty()) {
                 d->ensureStorage(kRemote);

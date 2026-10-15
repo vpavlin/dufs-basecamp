@@ -62,6 +62,8 @@ public:
     std::string download(const std::string& path, const std::string& localPath);
     std::string cancelTransfer(const std::string& id);
     std::string clearTransfers();
+    // A failed or cancelled transfer, from the start.
+    std::string retryTransfer(const std::string& id);
 
     // Image: fetched into the view's cache dir. Text: the first 64 KiB inline.
     std::string preview(const std::string& path);
@@ -86,6 +88,9 @@ public:
     std::string storageDownload(const std::string& cid, const std::string& localPath);
     // Fetches a CID someone shared, so this node holds it (and serves it, when announcing).
     std::string storageAdd(const std::string& cid);
+    // Copies a file from the Storage node being browsed to the other one (toStorageId), through this
+    // computer: the same name, so the same CID.
+    std::string storageCopy(const std::string& cid, const std::string& toStorageId);
     // Drops a file from this node.
     std::string storageRemove(const std::string& cid);
     // A file on a dufs server into Storage: storageId "logos-storage" (this computer's node, also for "")

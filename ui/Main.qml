@@ -260,6 +260,8 @@ Item {
     // The dufs servers only (Logos Storage is in the list too, as one more place).
     readonly property var dufsServers: servers.filter(function (s) { return !s.storage })
     readonly property bool isStorage: !!root.currentServer && !!root.currentServer.storage
+    // Browsing one Storage node: the other one (for "Copy to …").
+    readonly property string otherStorageId: root.st.current === "logos-storage" ? "logos-storage-node" : "logos-storage"
     readonly property var storage: st.storage || ({ state: "off", files: [] })
     // A Storage row's second line: how many files and where, or what is wrong.
     function storageLine(row) {
@@ -523,7 +525,7 @@ Item {
         wantPreview(e)
     }
     function wantPreview(e) {
-        if (!e || e.dir) return
+        if (!e || e.dir || e.partial) return
         if (e.kind !== "image" && e.kind !== "text") return
         if (root.requested[e.path]) return
         var r = root.requested; r[e.path] = true; root.requested = r
@@ -628,6 +630,7 @@ Item {
         case "store": case "promote": return "⇢"
         case "demote": return "⇠"
         case "add": return "+"
+        case "copy": return "⇄"
         default: return "↓"
         }
     }
@@ -637,12 +640,14 @@ Item {
         case "store": case "promote": return "In Storage"
         case "demote": return "On " + root.serverName(t.server)
         case "add": return "Held here"
+        case "copy": return "Copied"
         default: return "Done"
         }
     }
     function transferStep(t) {
         if (t.kind === "promote") return t.phase === "http" ? "From the server: " : "Into Storage: "
         if (t.kind === "demote") return t.phase === "http" ? "To the server: " : "From Storage: "
+        if (t.kind === "copy") return "Copying: "
         return ""
     }
     function copyText(t) { clip.text = t; clip.selectAll(); clip.copy(); clip.deselect(); toast("Copied", false) }
@@ -1080,8 +1085,10 @@ Item {
                                     Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
                                     Text {
                                         visible: !!modelData.cid || (!!root.st.query && modelData.rel !== modelData.name)
-                                        text: modelData.cid ? root.storageOrigin(modelData) + modelData.cid : (modelData.rel || "")
-                                        color: root.cFaint; font.pixelSize: 11; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText
+                                        text: modelData.partial === "arriving" ? "arriving…  ·  " + modelData.cid
+                                            : modelData.partial === "missing" ? "only its description arrived, not the data  ·  " + modelData.cid
+                                            : modelData.cid ? root.storageOrigin(modelData) + modelData.cid : (modelData.rel || "")
+                                        color: modelData.partial === "missing" ? root.cBad : root.cFaint; font.pixelSize: 11; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText
                                     }
                                 }
                                 Text { text: root.fmtSize(modelData.size, modelData.dir); color: root.cSub; font.pixelSize: 12; Layout.preferredWidth: 90; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
@@ -1407,7 +1414,9 @@ Item {
                                     color: root.cFaint
                                     font.pixelSize: 12
                                     textFormat: Text.PlainText
-                                    text: !root.selectedPreview ? (root.selectedEntry && (root.selectedEntry.kind === "image" || root.selectedEntry.kind === "text") ? "Loading preview..." : "No preview for this kind of file")
+                                    text: root.selectedEntry && root.selectedEntry.partial === "arriving" ? "Still arriving: the preview shows once its data is here."
+                                        : root.selectedEntry && root.selectedEntry.partial === "missing" ? "Only the file's description reached this node, not its data: whoever has it wasn't reachable. Copy it here from your other Storage node, or add it by CID again later."
+                                        : !root.selectedPreview ? (root.selectedEntry && (root.selectedEntry.kind === "image" || root.selectedEntry.kind === "text") ? "Loading preview..." : "No preview for this kind of file")
                                         : root.selectedPreview.state === "loading" ? "Loading preview..."
                                         : (root.selectedPreview.error || "")
                                 }
@@ -1423,7 +1432,14 @@ Item {
                             LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Copy link"; onClicked: root.copyText(root.selectedEntry.url) }
                             LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
                             LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "Copy CID"; onClicked: root.copyText(root.selectedEntry.cid) }
-                            LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "To a dufs server…"; enabled: root.dufsServers.length > 0; onClicked: toServerDialog.ask(root.selectedEntry) }
+                            LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "To a dufs server…"; enabled: root.dufsServers.length > 0 && !(root.selectedEntry && root.selectedEntry.partial); onClicked: toServerDialog.ask(root.selectedEntry) }
+                            LogosButton {
+                                visible: root.isStorage && !!root.storageNode
+                                Layout.fillWidth: true
+                                enabled: !(root.selectedEntry && root.selectedEntry.partial)
+                                text: root.otherStorageId === "logos-storage" ? "Copy to this computer" : "Copy to the Storage node"
+                                onClicked: root.act("storageCopy", [root.selectedEntry.cid, root.otherStorageId], "Copying " + root.selectedEntry.name)
+                            }
                             LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
                             LogosButton { Layout.fillWidth: true; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
                             LogosButton { Layout.fillWidth: true; text: !!root.selectedEntry && root.isPinned(root.selectedEntry.path) ? "Unpin" : "Pin"; onClicked: root.togglePin(root.selectedEntry.path) }
@@ -1490,6 +1506,12 @@ Item {
                                 text: "✕"; color: root.cSub; font.pixelSize: 13; textFormat: Text.PlainText
                                 MouseArea { anchors.fill: parent; anchors.margins: -6; onClicked: root.act("cancelTransfer", [modelData.id]) }
                             }
+                            Text {
+                                visible: modelData.state === "failed" || modelData.state === "cancelled"
+                                text: "↻"; color: retryMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 15; textFormat: Text.PlainText
+                                MouseArea { id: retryMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("retryTransfer", [modelData.id], "Trying " + modelData.name + " again") }
+                                ToolTip.visible: retryMouse.containsMouse; ToolTip.delay: 400; ToolTip.text: "Try again"
+                            }
                         }
                     }
                 }
@@ -1525,6 +1547,7 @@ Item {
         MenuItem { text: entryMenu.entry && root.isPinned(entryMenu.entry.path) ? "Unpin" : "Pin"; onTriggered: root.togglePin(entryMenu.entry.path) }
         MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
         MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: root.storageNode ? "Send to Logos Storage…" : "Send to Logos Storage"; enabled: !!entryMenu.entry && !entryMenu.entry.dir; onTriggered: root.sendToStorage(entryMenu.entry) }
+        MenuItem { visible: root.isStorage && !!root.storageNode; height: visible ? implicitHeight : 0; text: root.otherStorageId === "logos-storage" ? "Copy to this computer's Storage" : "Copy to the Storage node"; enabled: !!entryMenu.entry && !entryMenu.entry.partial; onTriggered: root.act("storageCopy", [entryMenu.entry.cid, root.otherStorageId], "Copying " + entryMenu.entry.name) }
         MenuItem { visible: root.isStorage; height: visible ? implicitHeight : 0; text: "Save to a dufs server…"; enabled: root.dufsServers.length > 0; onTriggered: toServerDialog.ask(entryMenu.entry) }
         MenuSeparator {}
         MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }
