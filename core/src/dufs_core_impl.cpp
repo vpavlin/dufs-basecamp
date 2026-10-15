@@ -1,4 +1,5 @@
 #include "dufs_core_impl.h"
+#include "logos_sdk.h"
 
 #include <QByteArray>
 #include <QCryptographicHash>
@@ -6,6 +7,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QMetaObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -19,6 +21,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <set>
+#include <cctype>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -27,6 +32,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 #include <memory>
 #include <deque>
@@ -39,13 +45,29 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.3";
+static const char* kVersion = "0.2.6";
 static const size_t kMaxRecent = 12;
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
 static const int kMaxPreviewJobs = 3;
+// Listing a node's files: it can be slow while the node is busy (a download looking for its holders).
+static const int kStorageListMs = 45000;
+// Logos Storage shows as one more server, with this id. Its "paths" are "/<cid>".
+static const char* kStorageId = "logos-storage";
+static const char* kStorageNodeId = "logos-storage-node";
+static const int kLocal = 0, kRemote = 1;
+// A text preview from Storage needs the whole file first (no ranges): up to this much.
+static const qint64 kMaxStorageText = 8LL * 1024 * 1024;
 static const int kMaxUploadJobs = 2;
 static const qint64 kCacheLimit = 400LL * 1024 * 1024;
+// Logos Storage: chunk size, and how long a call may take before it counts as unanswered. start and
+// downloadToUrl wait for the network (3.0 waits up to 30 s for a manifest, more than the default timeout).
+static const int64_t kChunk = 65536;
+static const int kStorageCallMs = 20000;
+static const int kStorageStartMs = 60000;
+static const int kStorageFetchMs = 90000;
+static const int kPollMs = 2000;
+static const qint64 kStorageGiveUpMs = 10LL * 60 * 1000;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -84,7 +106,12 @@ template <typename F>
 static auto guarded(const char* where, F fn)
 {
     return [where, fn](auto&&... args) mutable {
-        try { fn(std::forward<decltype(args)>(args)...); }
+        try {
+            // Qt probes a functor with other argument counts (QMetaObject::invokeMethod hands it a
+            // return-value slot); only the call that fits is made.
+            if constexpr (std::is_invocable_v<F&, decltype(args)...>) fn(std::forward<decltype(args)>(args)...);
+            else if constexpr (std::is_invocable_v<F&>) fn();
+        }
         catch (const std::exception& e) { std::fprintf(stderr, "[dufs_core] %s: %s\n", where, e.what()); }
         catch (...) { std::fprintf(stderr, "[dufs_core] %s: unknown exception\n", where); }
     };
@@ -237,6 +264,22 @@ struct Transfer {
     QPointer<QNetworkReply> reply;
     QFile* file = nullptr;
     std::string serverId, dir;
+    // Logos Storage: its session, the CID, the phase (http | storage) of a two-step copy, a temp file,
+    // the file Storage writes, where the file came from, and the manifests named like it before.
+    std::string session, cid, phase, tmp, storagePath, from, uploadName;
+    std::vector<std::string> before;
+    qint64 started = 0;
+    int tries = 0;
+    int node = 0;                            // which Storage node (kLocal / kRemote)
+    int copyTo = -1;                         // "copy": the node it goes to, once read from `node`
+    bool copyUp = false;                     // "copy", second half: uploading into copyTo
+    bool uploading() const { return kind == "store" || kind == "promote" || (kind == "copy" && copyUp); }
+};
+
+// Where a file in Storage came from (Storage itself keeps only its name).
+struct StoredMeta {
+    std::string name, from;
+    qint64 at = 0;
 };
 
 struct Preview {
@@ -272,7 +315,44 @@ struct DufsCorePrivate {
 
     bool emitPending = false;
 
-    explicit DufsCorePrivate(DufsCoreImpl* qq) : q(qq) {}
+    // Logos Storage
+    QObject* loop = nullptr;                 // this thread, for callbacks that come from another
+    // One per node: this computer's (storage_module) and one elsewhere (storage_gateway, when url is set).
+    struct StNode {
+        std::string url;                     // kRemote: the node's REST url
+        bool init = false, hostOwned = false, listing = false, events = false;
+        std::string state = "off", error;    // off | starting | ready | error
+        json files = json::array();
+        std::map<std::string, std::vector<std::string>> byName;
+        std::map<std::string, int64_t> size;
+        std::string peerId;                  // the node's own peer ID and dialable addresses (debug())
+        json addrs = json::array();
+        // CIDs this node has only the manifest of: an "add" still arriving, or one that never came.
+        // Storage lists a dataset once its manifest is in, before (and without) its data.
+        std::set<std::string> incomplete;
+        bool relistArmed = false;            // a refresh failed after a good listing: one more is due
+        std::string version;                 // kLocal: storage_module's version (3.0.3 has the download fix)
+    };
+    StNode nodes[2];
+    bool stPollArmed = false, stAdvertise = true;
+    std::map<std::string, StoredMeta> stIndex;              // cid -> where it came from (storage.json)
+    std::map<std::string, std::string> stSessions;          // "<node>|<Storage session>" -> transfer id
+    // Previews of files in Storage: "<node>|<cid>" downloading into the cache -> which preview it is for.
+    struct StoragePreview { std::string path, part, target; qint64 size = 0, started = 0; bool image = false; int node = 0; };
+    std::map<std::string, StoragePreview> stPreviewWait;
+    // "<node>|<cid>" -> transfers waiting for that CID's manifest before their download starts.
+    std::map<std::string, std::vector<std::string>> stManifestWait;
+
+    explicit DufsCorePrivate(DufsCoreImpl* qq) : q(qq), loop(new QObject()) {}
+    ~DufsCorePrivate() { delete loop; }
+
+    // A transfer of this CID already running on this node (the other node may fetch it at the same time).
+    bool storageBusy(const std::string& cid, int n)
+    {
+        for (auto& t : transfers)
+            if (t.state == "running" && t.cid == cid && (t.node == n || (t.kind == "copy" && t.copyTo == n))) return true;
+        return false;
+    }
 
     QNetworkAccessManager* net()
     {
@@ -322,7 +402,8 @@ struct DufsCorePrivate {
         places("recent", recent);
         if (recent.size() > kMaxRecent) recent.resize(kMaxRecent);
         currentId = jstr(j, "current", "");
-        if (!find(currentId)) currentId = servers.empty() ? "" : servers.front().id;
+        if (currentId == kStorageId || currentId == kStorageNodeId) path = "/";
+        else if (!find(currentId)) currentId = servers.empty() ? "" : servers.front().id;
         if (auto* s = current()) path = normDir(s->lastPath);
     }
     void save()
@@ -414,16 +495,39 @@ struct DufsCorePrivate {
         }), v.end());
     }
 
+    // Every file name the nodes know, by CID (the view labels pinned/recent Storage files with it).
+    json storageNames() const
+    {
+        json out = json::array();
+        std::set<std::string> seen;
+        for (auto& N : nodes)
+            for (auto& f : N.files) {
+                const std::string cid = jstr(f, "cid", "");
+                if (seen.insert(cid).second) out.push_back({{"cid", cid}, {"name", jstr(f, "name", "")}});
+            }
+        return out;
+    }
     json state()
     {
         json sv = json::array();
         for (auto& s : servers)
             sv.push_back({{"id", s.id}, {"name", s.name}, {"url", s.url}, {"user", s.user},
                           {"hasPassword", !s.password.empty()}});
+        // Logos Storage, listed like a server: the same browsing, previews and transfers.
+        auto storageRow = [&](int n, const char* id, const std::string& name) {
+            const StNode& N = nodes[n];
+            int count = (int)N.files.size();
+            sv.push_back({{"id", id}, {"name", name}, {"url", N.url}, {"user", ""}, {"hasPassword", false},
+                          {"storage", true}, {"remote", n == kRemote}, {"state", N.state}, {"stateError", N.error},
+                          {"count", count}});
+        };
+        storageRow(kLocal, kStorageId, "Logos Storage");
+        if (!nodes[kRemote].url.empty()) storageRow(kRemote, kStorageNodeId, "Storage node");
         json tr = json::array();
         for (auto& t : transfers)
             tr.push_back({{"id", t.id}, {"kind", t.kind}, {"name", t.name}, {"path", t.path}, {"local", t.local},
-                          {"state", t.state}, {"error", t.error}, {"done", t.done}, {"total", t.total}});
+                          {"state", t.state}, {"error", t.error}, {"done", t.done}, {"total", t.total},
+                          {"cid", t.cid}, {"phase", t.phase}, {"server", t.serverId}});
         json pv = json::object();
         for (auto& [k, p] : previews) {
             json o = {{"state", p.state}};
@@ -452,6 +556,9 @@ struct DufsCorePrivate {
             {"recent", placesJson(recent)},
             {"previewCache", !viewDir.empty()},
             {"downloadsDir", QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString()},
+            {"storage", {{"advertise", stAdvertise}, {"node", nodes[kRemote].url}, {"hostOwned", nodes[kLocal].hostOwned},
+                         {"localVersion", nodes[kLocal].version},
+                         {"files", storageNames()}}},
             {"notice", notice},
             {"noticeKind", noticeKind},
             {"noticeAt", noticeAt},
@@ -465,6 +572,21 @@ struct DufsCorePrivate {
         if (listReply) { listReply->abort(); listReply = nullptr; }
         entries = json::array();
         listError.clear();
+        if (onStorage()) {
+            ++listGen;
+            previews.clear();
+            previewQueue.clear();
+            path = "/";
+            perms = {{"upload", true}, {"delete", true}, {"search", true}, {"archive", false},
+                     {"mkdir", false}, {"rename", false}, {"storage", true}};
+            ensureStorage(currentNode());
+            storageEntries();
+            listStorage(currentNode());
+            changed();
+            return;
+        }
+        // Coming from Storage: its permissions (no folders, no rename) are not this server's.
+        if (perms.contains("storage")) perms = json::object();
         if (!s) { loading = false; perms = json::object(); changed(); return; }
         loading = true;
         previews.clear();
@@ -653,6 +775,754 @@ struct DufsCorePrivate {
         QObject::connect(r, &QNetworkReply::finished, guarded("download", [this, id, r] { r->deleteLater(); finishTransfer(id, r, false); }));
     }
 
+    // ── Logos Storage
+    // The node is shared: on Basecamp 0.3 the host inits and starts it, and other modules use it too,
+    // so this module never stops, restarts or reconfigures it. Calls that can wait on the network
+    // (download, fetch) go through the *AsyncResult variants with an explicit timeout; completion
+    // comes from the module's events, with polling as the fallback (one host build lost them).
+    void onLoop(std::function<void()> fn)
+    {
+        // Storage callbacks may run on another thread; the state lives on this one.
+        QMetaObject::invokeMethod(loop, guarded("storage", std::move(fn)), Qt::QueuedConnection);
+    }
+    static std::string resStr(const StdLogosResult& r)
+    {
+        return r.value.is_string() ? r.value.get<std::string>() : std::string();
+    }
+    std::string storageFile() const { return dataDir() + "/storage.json"; }
+    std::string storageTmp(const std::string& id) const { return dataDir() + "/storage-tmp/" + id; }
+    void loadStorage()
+    {
+        json j = readJsonFile(storageFile());
+        stAdvertise = jbool(j, "advertise", true);
+        nodes[kRemote].url = jstr(j, "node", "");
+        // Manifest-only CIDs per node ("0" this computer's, "1" the node elsewhere).
+        if (j.is_object() && j.contains("incomplete") && j["incomplete"].is_object())
+            for (int n : {kLocal, kRemote}) {
+                const std::string k = std::to_string(n);
+                if (j["incomplete"].contains(k) && j["incomplete"][k].is_array())
+                    for (auto& c : j["incomplete"][k]) if (c.is_string()) nodes[n].incomplete.insert(c.get<std::string>());
+            }
+        auto it = j.is_object() ? j.find("files") : j.end();
+        if (it == j.end() || !it->is_object()) return;
+        for (auto& [cid, m] : it->items())
+            stIndex[cid] = StoredMeta{jstr(m, "name", ""), jstr(m, "from", ""), (qint64)jnum(m, "at", 0)};
+    }
+    void saveStorage()
+    {
+        json files = json::object();
+        for (auto& [cid, m] : stIndex) files[cid] = {{"name", m.name}, {"from", m.from}, {"at", m.at}};
+        json inc = json::object();
+        for (int n : {kLocal, kRemote}) inc[std::to_string(n)] = std::vector<std::string>(nodes[n].incomplete.begin(), nodes[n].incomplete.end());
+        writeJsonFile(storageFile(), {{"advertise", stAdvertise}, {"node", nodes[kRemote].url}, {"incomplete", inc}, {"files", files}});
+    }
+
+    // Two Storage nodes, each listed as a "server": this computer's (storage_module, the host's node)
+    // and, when set, one elsewhere through storage_gateway. Both modules have the same API, so every
+    // call is written once: withStorage(n, [&](auto& sm) { sm.…; }).
+    template <typename F> void withStorage(int n, F&& f)
+    {
+        if (n == kLocal) f(q->modules().storage_module);
+        else f(q->modules().storage_gateway);
+    }
+    static std::string sessKey(int n, const std::string& s) { return std::to_string(n) + "|" + s; }
+    int nodeOfServer(const std::string& id) const
+    {
+        if (id == kStorageId) return kLocal;
+        if (id == kStorageNodeId && !nodes[kRemote].url.empty()) return kRemote;
+        return -1;
+    }
+    int currentNode() const { return nodeOfServer(currentId); }
+    bool onStorage() const { return currentNode() >= 0; }
+    // The node a Storage call without a choice goes to: the one being browsed, else this computer's.
+    int activeNode() const { return currentNode() >= 0 ? currentNode() : kLocal; }
+
+    void ensureStorage(int n)
+    {
+        StNode& N = nodes[n];
+        if (N.init) return;
+        if (n == kRemote && N.url.empty()) return;
+        N.init = true;
+        N.state = "starting";
+        N.error.clear();
+        bool failed = false;
+        withStorage(n, [&](auto& sm) {
+            if (N.events) return;
+            try {
+                sm.onStorageUploadDone([this, n](const std::string& p) { onLoop([this, n, p] { uploadDone(n, json::parse(p, nullptr, false)); }); });
+                sm.onStorageDownloadDone([this, n](const std::string& p) { onLoop([this, n, p] { downloadDone(n, json::parse(p, nullptr, false)); }); });
+                sm.onStorageUploadProgress([this, n](const std::string& p) { onLoop([this, n, p] { progress(n, json::parse(p, nullptr, false)); }); });
+                sm.onStorageDownloadProgress([this, n](const std::string& p) { onLoop([this, n, p] { progress(n, json::parse(p, nullptr, false)); }); });
+                sm.onStorageDownloadManifestDone([this, n](const std::string& p) { onLoop([this, n, p] {
+                    json j = json::parse(p, nullptr, false);
+                    manifestDone(n, jstr(j, "cid", ""), jbool(j, "success", false), jstr(j, "error", ""));
+                }); });
+                sm.onStorageRemoveDone([this, n](const std::string& p) { onLoop([this, n, p] {
+                    json j = json::parse(p, nullptr, false);
+                    if (!jbool(j, "success", true)) note("Could not remove it from Storage: " + jstr(j, "error", "unknown error"), "error");
+                    listStorage(n);
+                }); });
+                sm.onStorageStart([this, n](const std::string& p) { onLoop([this, n, p] {
+                    json j = json::parse(p, nullptr, false);
+                    // The gateway says here whether its node answers.
+                    if (!jbool(j, "success", true)) {
+                        nodes[n].state = "error"; nodes[n].error = jstr(j, "message", "The Storage node did not answer.");
+                        storageEntries(); changed(); return;
+                    }
+                    listStorage(n);
+                }); });
+                N.events = true;
+            } catch (const std::exception& e) {
+                N.state = "error"; N.error = std::string("Logos Storage is not available: ") + e.what();
+                failed = true;
+            }
+        });
+        if (failed) { changed(); return; }
+        bool inited = false;
+        if (n == kLocal) {
+            // A host that leaves Storage alone gets the node set up here, with its defaults (the public
+            // logos.test network). On Basecamp 0.3 init() is refused: the node is the host's, used as it is.
+            try { inited = q->modules().storage_module.init("{}"); } catch (...) { inited = false; }
+            N.hostOwned = !inited;
+        } else {
+            // A node elsewhere: the gateway is told where it is.
+            try { inited = q->modules().storage_gateway.init(json({{"url", N.url}}).dump()); } catch (...) { inited = false; }
+            if (!inited) {
+                N.state = "error"; N.error = "That address does not look like a Storage node's (http://host:port).";
+                changed();
+                return;
+            }
+        }
+        // Which storage_module: before 3.0.3 its downloads ignore a holder that answered (libstorage,
+        // logos-storage-nim #1540), so a stuck download can say what would fix it.
+        if (n == kLocal)
+            q->modules().storage_module.moduleVersionAsyncResult([this](logos::AsyncResult<std::string> ar) {
+                if (!ar.ok()) return;
+                const std::string v = ar.value;
+                onLoop([this, v] { nodes[kLocal].version = v; changed(); });
+            }, kStorageCallMs);
+        // start() also when the host started it already: harmless, and it answers either way.
+        const std::string what = n == kLocal ? "Logos Storage did not answer (" : "The Storage gateway did not answer (";
+        const std::string hint = n == kLocal ? "). Is storage_module installed?" : "). Is storage_gateway installed?";
+        withStorage(n, [&](auto& sm) {
+            sm.startAsyncResult([this, n, what, hint](logos::AsyncResult<bool> ar) {
+                const bool answered = ar.ok();
+                const std::string err = answered ? std::string() : ar.error.code;
+                onLoop([this, n, answered, err, what, hint] {
+                    if (!answered) { nodes[n].state = "error"; nodes[n].error = what + err + hint; storageEntries(); changed(); return; }
+                    listStorage(n);
+                });
+            }, kStorageStartMs);
+        });
+        changed();
+    }
+
+    // What the node holds: manifests(), with where each file came from.
+    void listStorage(int n)
+    {
+        StNode& N = nodes[n];
+        if (!N.init) return;
+        N.listing = true;
+        withStorage(n, [&](auto& sm) { sm.manifestsAsyncResult([this, n](logos::AsyncResult<StdLogosResult> ar) {
+            json arr;
+            std::string err;
+            if (!ar.ok()) err = "Logos Storage did not answer (" + ar.error.code + ").";
+            else if (!ar.value.success) err = ar.value.error.empty() ? "Logos Storage refused to list its files." : ar.value.error;
+            else {
+                arr = ar.value.value;
+                if (arr.is_string()) arr = json::parse(arr.get<std::string>(), nullptr, false);
+            }
+            onLoop([this, n, arr, err] { gotManifests(n, arr, err); });
+        }, kStorageListMs); });
+        changed();
+    }
+    // A Storage "server"'s listing: its files as entries like a dufs folder's, at "/<cid>", with the
+    // CID and where each came from. Search filters by name. Rebuilt whenever the node's list comes in
+    // (previews are kept: the same path is the same CID, the same bytes).
+    void storageEntries()
+    {
+        const int n = currentNode();
+        if (n < 0) return;
+        const StNode& N = nodes[n];
+        loading = N.state == "starting" || (N.listing && N.files.empty());
+        listError = N.state == "error" ? N.error : "";
+        json out = json::array();
+        const std::string q = lower(query);
+        for (auto& f : N.files) {
+            const std::string name = jstr(f, "name", "");
+            if (!q.empty() && lower(name).find(q) == std::string::npos) continue;
+            const std::string cid = jstr(f, "cid", "");
+            out.push_back({{"name", name}, {"rel", name}, {"path", "/" + cid}, {"dir", false},
+                           {"kind", kindOf(name, false)}, {"size", jnum(f, "size", 0)},
+                           {"mtime", jnum(f, "at", 0)}, {"url", ""}, {"cid", cid},
+                           {"from", jstr(f, "from", "")}, {"mime", jstr(f, "mime", "")},
+                           // "arriving" (an add still running) or "missing" (only the manifest came)
+                           {"partial", !N.incomplete.count(cid) ? "" : storageBusy(cid, n) ? "arriving" : "missing"}});
+        }
+        entries = out;
+    }
+
+    void gotManifests(int n, const json& arr, const std::string& err)
+    {
+        StNode& N = nodes[n];
+        N.listing = false;
+        // A node that has listed its files before keeps them when one refresh is slow or fails (it is
+        // busy with a download, or the network hiccuped): no error over a good list, another look soon.
+        if (!err.empty() && N.state == "ready") {
+            if (!N.relistArmed) {
+                N.relistArmed = true;
+                QTimer::singleShot(5000, loop, guarded("relist", [this, n] { nodes[n].relistArmed = false; listStorage(n); }));
+            }
+            changed();
+            return;
+        }
+        if (!err.empty()) {
+            // Not started yet (the host starts it a moment after Basecamp opens): say so and look again.
+            N.state = "error"; N.error = err;
+            storageEntries();
+            changed();
+            return;
+        }
+        N.state = "ready"; N.error.clear();
+        json files = json::array();
+        N.byName.clear();
+        N.size.clear();
+        if (arr.is_array()) {
+            for (auto& m : arr) {
+                if (!m.is_object()) continue;
+                const std::string cid = jstr(m, "cid", "");
+                if (cid.empty()) continue;
+                const std::string fname = jstr(m, "filename", "");
+                const int64_t size = jnum(m, "datasetSize", 0);
+                N.byName[fname].push_back(cid);
+                N.size[cid] = size;
+                auto meta = stIndex.find(cid);
+                const std::string name = !fname.empty() ? fname : meta != stIndex.end() && !meta->second.name.empty() ? meta->second.name : cid;
+                files.push_back({{"cid", cid}, {"name", name}, {"size", size}, {"mime", jstr(m, "mimetype", "")},
+                                 {"kind", kindOf(name, false)},
+                                 {"from", meta != stIndex.end() ? meta->second.from : ""},
+                                 {"at", meta != stIndex.end() ? meta->second.at : 0}});
+            }
+        }
+        // The newest first (what this app put there carries a time), then by name.
+        std::sort(files.begin(), files.end(), [](const json& a, const json& b) {
+            if (a["at"].get<qint64>() != b["at"].get<qint64>()) return a["at"].get<qint64>() > b["at"].get<qint64>();
+            return lower(a["name"].get<std::string>()) < lower(b["name"].get<std::string>());
+        });
+        N.files = files;
+        if (N.peerId.empty()) learnPeer(n);
+        storageEntries();
+        pollStorage();
+        changed();
+    }
+
+    // The node's peer ID and addresses, for linking the two nodes.
+    void learnPeer(int n)
+    {
+        withStorage(n, [&](auto& sm) { sm.debugAsyncResult([this, n](logos::AsyncResult<StdLogosResult> ar) {
+            if (!ar.ok() || !ar.value.success) return;
+            json v = ar.value.value;
+            if (v.is_string()) v = json::parse(v.get<std::string>(), nullptr, false);
+            if (!v.is_object()) return;
+            const std::string id = jstr(v, "id", "");
+            json addrs = json::array();
+            // Direct addresses only: not relay circuits or Mix routes, which this node can't dial.
+            if (v.contains("addrs") && v["addrs"].is_array())
+                for (auto& a : v["addrs"])
+                    if (a.is_string() && a.get<std::string>().find("p2p-circuit") == std::string::npos
+                        && a.get<std::string>().find("mix") == std::string::npos) addrs.push_back(a);
+            onLoop([this, n, id, addrs] { nodes[n].peerId = id; nodes[n].addrs = addrs; linkNodes(); });
+        }, kStorageCallMs); });
+    }
+    // With a node elsewhere too: this computer's node dials it directly. A node behind NAT can't be
+    // dialled, and a holder found only through the DHT is often ignored (libstorage's download swarm,
+    // fixed in logos-storage-nim #1540): a direct connection lets either fetch from the other.
+    void linkNodes()
+    {
+        const StNode& R = nodes[kRemote];
+        if (R.url.empty() || R.peerId.empty() || R.addrs.empty() || !nodes[kLocal].init) return;
+        std::vector<std::string> addrs;
+        for (auto& a : R.addrs) addrs.push_back(a.get<std::string>());
+        const std::string peer = R.peerId;
+        withStorage(kLocal, [&](auto& sm) { sm.connectAsyncResult(peer, addrs, [](logos::AsyncResult<StdLogosResult>) {}, kStorageCallMs); });
+    }
+
+    // ── storage transfers
+    //   store    a file on this computer -> Storage
+    //   fetch    Storage -> a file on this computer (and, with no file wanted, "add": just held there)
+    //   promote  a dufs server -> Storage   (HTTP into a temp file, then upload)
+    //   demote   Storage -> a dufs server   (download into a temp file, then HTTP PUT)
+    //   copy     one Storage node -> the other, through this computer (download, then upload)
+    // Each runs against one node (Transfer::node).
+    Transfer& newStorageTransfer(int n, const std::string& kind, const std::string& name)
+    {
+        Transfer t;
+        t.id = newId();
+        t.kind = kind;
+        t.name = name;
+        t.node = n;
+        t.started = QDateTime::currentMSecsSinceEpoch();
+        transfers.push_back(t);
+        return transfers.back();
+    }
+    void failTransfer(Transfer& t, const std::string& error)
+    {
+        t.state = "failed";
+        t.error = error;
+        if (!t.session.empty()) stSessions.erase(sessKey(t.node, t.session));
+        if (t.file) { t.file->close(); delete t.file; t.file = nullptr; }
+        cleanTmp(t);
+        storageEntries();
+        changed();
+    }
+    void cleanTmp(Transfer& t)
+    {
+        if (t.tmp.empty()) return;
+        std::error_code ec;
+        fs::remove_all(fs::path(t.tmp).parent_path(), ec);
+    }
+
+    // Upload a file on disk to its node; the CID arrives in uploadDone (or the poll).
+    void storeFile(const std::string& id, const std::string& path)
+    {
+        Transfer* t = transfer(id);
+        if (!t) return;
+        const int n = t->node;
+        t->phase = "storage";
+        t->state = "running";
+        t->done = 0;
+        QFileInfo fi(QString::fromStdString(path));
+        t->total = fi.size();
+        // Manifests already named like this one: the poll must not take one of them for the new upload.
+        t->before.clear();
+        auto byName = nodes[n].byName.find(fi.fileName().toStdString());
+        if (byName != nodes[n].byName.end()) t->before = byName->second;
+        t->uploadName = fi.fileName().toStdString();
+        t->started = QDateTime::currentMSecsSinceEpoch();
+        withStorage(n, [&](auto& sm) { sm.uploadUrlAsyncResult(path, kChunk, stAdvertise, [this, id, n](logos::AsyncResult<StdLogosResult> ar) {
+            const bool ok = ar.ok() && ar.value.success;
+            const std::string sess = ok ? resStr(ar.value) : "";
+            const std::string err = !ar.ok() ? "Logos Storage did not answer (" + ar.error.code + ")."
+                                             : (ar.value.error.empty() ? "Logos Storage refused the file." : ar.value.error);
+            onLoop([this, id, n, ok, sess, err] {
+                Transfer* x = transfer(id);
+                if (!x || x->state != "running") return;
+                if (!ok) { failTransfer(*x, err); return; }
+                x->session = sess;
+                stSessions[sessKey(n, sess)] = id;
+                schedulePoll();
+            });
+        }, kStorageCallMs); });
+        changed();
+    }
+    // Download a CID from its node to a file on disk; done in downloadDone (or the poll).
+    void fetchFile(const std::string& id, const std::string& cid, const std::string& path)
+    {
+        Transfer* t = transfer(id);
+        if (!t) return;
+        const int n = t->node;
+        t->tries++;
+        t->phase = "storage";
+        t->state = "running";
+        t->cid = cid;
+        t->done = 0;
+        std::error_code ec;
+        fs::create_directories(fs::path(path).parent_path(), ec);
+        fs::remove(path, ec);
+        t->storagePath = path;
+        t->started = QDateTime::currentMSecsSinceEpoch();
+        if (t->kind == "add" && nodes[n].incomplete.insert(cid).second) saveStorage();
+        linkNodes();
+        // storage_module looks the manifest up INSIDE downloadToUrl, before it returns, and serves one
+        // call at a time: a CID nobody answers for would hold every later call (an upload) until the
+        // lookup gave up. So the manifest first, with the call that does not block (downloadManifest,
+        // done in an event), and the download once it is here. A manifest the node has: straight on.
+        if (!nodes[n].size.count(cid)) {
+            // Not on this node yet: listed once its manifest is in, whole once the download ends.
+            if (nodes[n].incomplete.insert(cid).second) saveStorage();
+            const std::string key = sessKey(n, cid);
+            auto& waiting = stManifestWait[key];
+            waiting.push_back(id);
+            if (waiting.size() > 1) { changed(); return; }
+            withStorage(n, [&](auto& sm) { sm.downloadManifestAsyncResult(cid, false, false, [this, n, cid](logos::AsyncResult<StdLogosResult> ar) {
+                const bool sent = ar.ok() && ar.value.success;
+                const std::string err = !ar.ok() ? std::string() : ar.value.error;
+                onLoop([this, n, cid, sent, err] { if (!sent && !err.empty()) manifestDone(n, cid, false, err); });
+            }, kStorageCallMs); });
+            // No event (one host build lost them): give up on the lookup after a while.
+            QTimer::singleShot(kStorageFetchMs + 30000, loop, guarded("manifest wait", [this, n, cid] {
+                if (stManifestWait.count(sessKey(n, cid))) manifestDone(n, cid, false, "");
+            }));
+            changed();
+            return;
+        }
+        beginStorageDownload(id);
+    }
+    // The manifest is here (or never came): the waiting transfers start their download (or fail).
+    void manifestDone(int n, const std::string& cid, bool ok, const std::string& err)
+    {
+        auto it = stManifestWait.find(sessKey(n, cid));
+        if (it == stManifestWait.end()) return;
+        std::vector<std::string> ids = it->second;
+        stManifestWait.erase(it);
+        for (auto& id : ids) {
+            Transfer* t = transfer(id);
+            if (!t || t->state != "running") continue;
+            if (ok) beginStorageDownload(id);
+            else retryOrFail(*t, downloadError(err));
+        }
+        changed();
+    }
+    void beginStorageDownload(const std::string& id)
+    {
+        Transfer* t = transfer(id);
+        if (!t) return;
+        const int n = t->node;
+        const std::string cid = t->cid, path = t->storagePath;
+        // local=false: from the network when this node lacks it. isPrivate=false. advertise=false while it
+        // downloads: else the node announces itself as a holder before it has the data, and leaves a dead
+        // provider in the DHT when the download fails. Announced once whole (fetched()).
+        withStorage(n, [&](auto& sm) { sm.downloadToUrlAsyncResult(cid, path, false, kChunk, false, false,
+            [this, id, n](logos::AsyncResult<StdLogosResult> ar) {
+                const bool ok = ar.ok() && ar.value.success;
+                const std::string sess = ok ? resStr(ar.value) : "";
+                const std::string err = !ar.ok() ? "Logos Storage did not find it in time. Is the file's holder online?"
+                                                 : downloadError(ar.value.error);
+                onLoop([this, id, n, ok, sess, err] {
+                    Transfer* x = transfer(id);
+                    if (!x || x->state != "running") return;
+                    if (!ok) { retryOrFail(*x, err); return; }
+                    x->session = sess.empty() ? x->cid : sess;
+                    stSessions[sessKey(n, x->session)] = id;
+                    schedulePoll();
+                });
+            }, kStorageFetchMs); });
+        changed();
+    }
+
+    // A download from another node often fails the first time and works the second: the first one
+    // brings the manifest and finds the holder, then its block stream closes ("Read stream failed").
+    // Seen between two logos.test nodes, 2026-10-14. So one more try, a moment later.
+    void retryOrFail(Transfer& t, const std::string& error)
+    {
+        if (t.tries >= 2 || t.state != "running") { failTransfer(t, error); return; }
+        if (!t.session.empty()) stSessions.erase(sessKey(t.node, t.session));
+        t.session.clear();
+        const std::string id = t.id, cid = t.cid, path = t.storagePath;
+        QTimer::singleShot(3000, loop, guarded("download retry", [this, id, cid, path] {
+            Transfer* x = transfer(id);
+            if (x && x->state == "running") fetchFile(id, cid, path);
+        }));
+    }
+    // libstorage says "Failed to start download" when no holder of the CID answered.
+    static std::string downloadError(const std::string& e)
+    {
+        if (e.empty() || e.find("Failed to start download") != std::string::npos)
+            return "Nobody holding this CID answered. The computer that has it must be online and reachable "
+                   "(behind a home router it often isn't); try again in a few minutes.";
+        return "The download failed: " + e;
+    }
+    void progress(int n, const json& p)
+    {
+        auto it = stSessions.find(sessKey(n, jstr(p, "sessionId", "")));
+        if (it == stSessions.end()) return;
+        Transfer* t = transfer(it->second);
+        if (!t || t->phase != "storage") return;
+        t->done = jnum(p, "bytes", t->done);
+        const int64_t total = jnum(p, "total", 0);
+        if (total > 0) t->total = total;
+        changed();
+    }
+    void uploadDone(int n, const json& p)
+    {
+        auto it = stSessions.find(sessKey(n, jstr(p, "sessionId", "")));
+        if (it == stSessions.end()) return;
+        const std::string id = it->second;
+        stSessions.erase(it);
+        Transfer* t = transfer(id);
+        if (!t || t->state != "running") return;
+        if (!jbool(p, "success", false)) { failTransfer(*t, "Storage did not take it: " + jstr(p, "error", "unknown error")); return; }
+        stored(*t, jstr(p, "cid", ""));
+    }
+    void stored(Transfer& t, const std::string& cid)
+    {
+        t.cid = cid;
+        t.state = "done";
+        t.done = t.total;
+        // A copy keeps where the file first came from.
+        if (t.kind != "copy" || !stIndex.count(cid)) stIndex[cid] = StoredMeta{t.uploadName, t.from, QDateTime::currentMSecsSinceEpoch()};
+        saveStorage();
+        cleanTmp(t);
+        note("In " + nodeName(t.node) + ": " + t.name, "ok");
+        listStorage(t.node);
+        changed();
+    }
+    void downloadDone(int n, const json& p)
+    {
+        const std::string sid = jstr(p, "sessionId", "");
+        if (stPreviewWait.count(sessKey(n, sid)))
+            previewDone(sessKey(n, sid), jbool(p, "success", false), jstr(p, "error", ""));
+        auto it = stSessions.find(sessKey(n, sid));
+        if (it == stSessions.end()) return;
+        const std::string id = it->second;
+        stSessions.erase(it);
+        Transfer* t = transfer(id);
+        if (!t || t->state != "running") return;
+        if (!jbool(p, "success", false)) { retryOrFail(*t, downloadError(jstr(p, "error", "unknown error"))); return; }
+        fetched(*t);
+    }
+    void fetched(Transfer& t)
+    {
+        std::error_code ec;
+        if (t.total <= 0) t.total = (qint64)fs::file_size(t.storagePath, ec);
+        t.done = t.total;
+        // Whole now: this node may say it has it.
+        if (stAdvertise) {
+            const std::string cid = t.cid;
+            withStorage(t.node, [&](auto& sm) { sm.setAdvertiseAsyncResult(cid, true, [](logos::AsyncResult<StdLogosResult>) {}, kStorageCallMs); });
+        }
+        if (nodes[t.node].incomplete.erase(t.cid)) saveStorage();
+        if (t.kind == "demote") { putToServer(t); return; }
+        if (t.kind == "copy") {
+            // Read from the one node: now into the other, under the same name (so the same CID).
+            const std::string id = t.id;
+            t.node = t.copyTo;
+            t.copyUp = true;
+            t.session.clear();
+            t.from = "copied from " + (t.copyTo == kLocal ? std::string("the Storage node") : std::string("this computer's Storage"));
+            storeFile(id, t.tmp);
+            return;
+        }
+        if (t.kind == "add") {
+            // Only held by the node: the file written here was the way to know it arrived.
+            cleanTmp(t);
+            stIndex.emplace(t.cid, StoredMeta{t.name, "added by CID", QDateTime::currentMSecsSinceEpoch()});
+            saveStorage();
+        } else {
+            fs::rename(t.storagePath, t.local, ec);
+            if (ec) { failTransfer(t, "Downloaded, but could not save to " + t.local + "."); return; }
+            stIndex.emplace(t.cid, StoredMeta{t.name, "by CID", QDateTime::currentMSecsSinceEpoch()});
+            saveStorage();
+            cleanTmp(t);
+        }
+        t.state = "done";
+        listStorage(t.node);
+        changed();
+    }
+    std::string nodeName(int n) const { return n == kLocal ? "Logos Storage" : "the Storage node"; }
+
+    // While storage transfers run: read the facts back, in case an event never arrives. An upload is
+    // done when a manifest with its file name appears (one that was not there before); a download
+    // when the file on disk is as big as the manifest says.
+    void schedulePoll()
+    {
+        if (stPollArmed) return;
+        stPollArmed = true;
+        QTimer::singleShot(kPollMs, loop, guarded("storage poll", [this] {
+            stPollArmed = false;
+            std::set<int> busy;
+            for (auto& t : transfers) if (t.state == "running" && t.phase == "storage") busy.insert(t.node);
+            for (auto& [k, w] : stPreviewWait) busy.insert(w.node);
+            for (int n : busy) listStorage(n);
+        }));
+    }
+    void pollStorage()
+    {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        bool pending = false;
+        for (auto& t : transfers) {
+            if (t.state != "running" || t.phase != "storage") continue;
+            pending = true;
+            StNode& N = nodes[t.node];
+            if (t.uploading()) {
+                auto it = N.byName.find(t.uploadName);
+                std::string cid;
+                if (it != N.byName.end())
+                    for (auto& c : it->second)
+                        if (std::find(t.before.begin(), t.before.end(), c) == t.before.end()) cid = c;
+                // The same file again keeps its CID: after a while, the one with the same size.
+                if (cid.empty() && it != N.byName.end() && now - t.started > 30000)
+                    for (auto& c : it->second) if (N.size[c] == t.total) cid = c;
+                if (!cid.empty() && !t.session.empty()) { stSessions.erase(sessKey(t.node, t.session)); stored(t, cid); continue; }
+                if (now - t.started > kStorageGiveUpMs) failTransfer(t, "Storage never said the upload finished (10 min).");
+            } else {
+                std::error_code ec;
+                auto sz = N.size.find(t.cid);
+                const qint64 have = fs::exists(t.storagePath, ec) ? (qint64)fs::file_size(t.storagePath, ec) : -1;
+                if (have >= 0) t.done = have;
+                if (sz != N.size.end() && sz->second > 0) t.total = sz->second;
+                if (sz != N.size.end() && sz->second > 0 && have == sz->second && !t.session.empty()) {
+                    stSessions.erase(sessKey(t.node, t.session));
+                    fetched(t);
+                    continue;
+                }
+                if (now - t.started > kStorageGiveUpMs && have <= 0)
+                    failTransfer(t, "Nobody delivered it within 10 minutes. Is the file's holder online and reachable?");
+            }
+        }
+        // Previews: the cache file as big as the manifest says.
+        std::vector<std::string> whole;
+        for (auto& [key, w] : stPreviewWait) {
+            pending = true;
+            std::error_code ec;
+            const qint64 have = fs::exists(w.part, ec) ? (qint64)fs::file_size(w.part, ec) : -1;
+            if (w.size > 0 && have == w.size) whole.push_back(key);
+            else if (now - w.started > kStorageGiveUpMs) previewDone(key, false, "Storage did not deliver it in time.");
+        }
+        for (auto& key : whole) previewDone(key, true, "");
+        if (pending) schedulePoll();
+    }
+
+    // A preview of a file in Storage: the whole file into the view's cache (Storage has no ranges),
+    // then an image is shown from there, text read from it.
+    void startStoragePreview(const std::string& p, const json& e)
+    {
+        auto& pv = previews[p];
+        const int n = currentNode();
+        const std::string cid = jstr(e, "cid", "");
+        const std::string kind = jstr(e, "kind", "");
+        const qint64 size = jnum(e, "size", 0);
+        if (n < 0 || cid.empty()) { pv.state = "error"; pv.error = "No CID for this file."; return; }
+        if (cacheDir().empty()) { pv.state = "error"; pv.error = "The view did not register its cache folder."; return; }
+        if (kind == "text" && size > kMaxStorageText) { pv.state = "error"; pv.error = "Too large to preview from Storage (over 8 MB): download it."; return; }
+        const std::string ext = extOf(jstr(e, "name", ""));
+        // By CID: the same bytes whichever node holds them.
+        const std::string target = cacheDir() + "/storage-" + cid + (ext.empty() ? "" : "." + ext);
+        std::error_code ec;
+        if (fs::exists(target, ec) && (size <= 0 || (qint64)fs::file_size(target, ec) == size)) {
+            showStoragePreview(p, target, kind == "image");
+            return;
+        }
+        const std::string key = sessKey(n, cid);
+        if (stPreviewWait.count(key)) { stPreviewWait[key].path = p; return; }
+        fs::create_directories(cacheDir(), ec);
+        StoragePreview w;
+        w.path = p; w.target = target; w.part = target + ".part" + std::to_string(n); w.size = size; w.node = n;
+        w.started = QDateTime::currentMSecsSinceEpoch(); w.image = kind == "image";
+        fs::remove(w.part, ec);
+        stPreviewWait[key] = w;
+        previewJobs++;
+        ensureStorage(n);
+        // Only what the node holds (local=true would fail on a manifest-only file, so the network is
+        // allowed), not announced: a preview is no reason to serve the file.
+        withStorage(n, [&](auto& sm) { sm.downloadToUrlAsyncResult(cid, w.part, false, kChunk, false, false,
+            [this, key](logos::AsyncResult<StdLogosResult> ar) {
+                const bool ok = ar.ok() && ar.value.success;
+                const std::string err = !ar.ok() ? std::string() : ar.value.error;
+                onLoop([this, key, ok, err] {
+                    // No answer within the timeout can still mean "running": the poll decides.
+                    if (!ok && !err.empty()) previewDone(key, false, err);
+                    else schedulePoll();
+                });
+            }, kStorageFetchMs); });
+    }
+    void previewDone(const std::string& key, bool ok, const std::string& err)
+    {
+        auto it = stPreviewWait.find(key);
+        if (it == stPreviewWait.end()) return;
+        StoragePreview w = it->second;
+        stPreviewWait.erase(it);
+        previewJobs = std::max(0, previewJobs - 1);
+        std::error_code ec;
+        if (ok) fs::rename(w.part, w.target, ec);
+        if (!ok || ec) {
+            fs::remove(w.part, ec);
+            auto pit = previews.find(w.path);
+            if (pit != previews.end()) { pit->second.state = "error"; pit->second.error = ok ? "Cannot write the preview cache." : downloadError(err.empty() ? "unknown error" : err); }
+        } else showStoragePreview(w.path, w.target, w.image);
+        pumpPreviews();
+        pruneCache();
+        changed();
+    }
+    void showStoragePreview(const std::string& p, const std::string& file, bool image)
+    {
+        auto pit = previews.find(p);
+        if (pit == previews.end()) return;
+        auto& x = pit->second;
+        if (image) { x.state = "ready"; x.file = file; return; }
+        QFile f(QString::fromStdString(file));
+        if (!f.open(QIODevice::ReadOnly)) { x.state = "error"; x.error = "Cannot read the preview cache."; return; }
+        QByteArray b = f.read(kTextPreviewBytes);
+        if (looksBinary(b)) { x.state = "error"; x.error = "This looks like a binary file, so there is no text preview."; return; }
+        x.text = QString::fromUtf8(b).toStdString();
+        x.truncated = f.size() > kTextPreviewBytes;
+        x.state = "ready";
+    }
+
+    // promote: the server's file into a temp file, then into Storage.
+    void startPromote(Transfer& t)
+    {
+        Server* s = find(t.serverId);
+        if (!s) { failTransfer(t, "The server was removed."); return; }
+        ensurePrivateDir(storageTmp(t.id));
+        t.tmp = storageTmp(t.id) + "/" + t.name;
+        auto* f = new QFile(QString::fromStdString(t.tmp));
+        if (!f->open(QIODevice::WriteOnly | QIODevice::Truncate)) { delete f; failTransfer(t, "Cannot write a temporary file."); return; }
+        t.file = f;
+        t.state = "running";
+        t.phase = "http";
+        QNetworkReply* r = watch(net()->get(request(*s, urlFor(*s, t.path), 120000)));
+        t.reply = r;
+        const std::string id = t.id;
+        QObject::connect(r, &QNetworkReply::readyRead, guarded("promote read", [this, id, r] {
+            Transfer* x = transfer(id);
+            if (!x || !x->file) return;
+            if (r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() >= 400) return;
+            x->file->write(r->readAll());
+        }));
+        QObject::connect(r, &QNetworkReply::downloadProgress, guarded("promote progress", [this, id](qint64 got, qint64 total) {
+            if (Transfer* x = transfer(id)) { x->done = got; if (total > 0) x->total = total; changed(); }
+        }));
+        QObject::connect(r, &QNetworkReply::finished, guarded("promote", [this, id, r] {
+            r->deleteLater();
+            Transfer* x = transfer(id);
+            if (!x) return;
+            x->reply = nullptr;
+            if (x->file) { x->file->close(); delete x->file; x->file = nullptr; }
+            if (x->state == "cancelled") { cleanTmp(*x); changed(); return; }
+            if (r->error() != QNetworkReply::NoError) { failTransfer(*x, httpError(r)); return; }
+            storeFile(id, x->tmp);
+        }));
+        changed();
+    }
+    // demote, second half: the downloaded temp file onto the server.
+    void putToServer(Transfer& t)
+    {
+        Server* s = find(t.serverId);
+        if (!s) { failTransfer(t, "The server was removed."); return; }
+        auto* f = new QFile(QString::fromStdString(t.storagePath));
+        if (!f->open(QIODevice::ReadOnly)) { delete f; failTransfer(t, "The downloaded file is missing."); return; }
+        t.file = f;
+        t.phase = "http";
+        t.done = 0;
+        t.total = f->size();
+        QNetworkRequest req = request(*s, urlFor(*s, t.path), 120000);
+        req.setHeader(QNetworkRequest::ContentLengthHeader, t.total);
+        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+        QNetworkReply* r = watch(net()->put(req, f));
+        t.reply = r;
+        const std::string id = t.id;
+        QObject::connect(r, &QNetworkReply::uploadProgress, guarded("demote progress", [this, id](qint64 sent, qint64 total) {
+            if (Transfer* x = transfer(id)) { x->done = sent; if (total > 0) x->total = total; changed(); }
+        }));
+        QObject::connect(r, &QNetworkReply::finished, guarded("demote", [this, id, r] {
+            r->deleteLater();
+            Transfer* x = transfer(id);
+            if (!x) return;
+            x->reply = nullptr;
+            if (x->file) { x->file->close(); delete x->file; x->file = nullptr; }
+            if (x->state == "cancelled") { cleanTmp(*x); changed(); return; }
+            if (r->error() != QNetworkReply::NoError) { failTransfer(*x, httpError(r)); return; }
+            x->state = "done";
+            x->done = x->total;
+            cleanTmp(*x);
+            if (Server* sv = find(x->serverId)) note("Saved " + x->name + " to " + sv->name, "ok");
+            if (x->serverId == currentId && parentOf(x->path) == path && query.empty()) list();
+            changed();
+        }));
+        changed();
+    }
+
     // ── previews
     std::string cacheDir() const { return viewDir.empty() ? "" : viewDir + "/cache"; }
     static std::string cachePrefix(const Server& s)
@@ -717,6 +1587,12 @@ struct DufsCorePrivate {
 
     void startPreview(const std::string& p)
     {
+        if (onStorage()) {
+            const json* se = entryFor(p);
+            if (!se) { previews[p].state = "error"; previews[p].error = "Not in Storage any more."; return; }
+            startStoragePreview(p, *se);
+            return;
+        }
         Server* s = current();
         const json* e = entryFor(p);
         auto& pv = previews[p];
@@ -801,7 +1677,12 @@ struct DufsCorePrivate {
 DufsCoreImpl::DufsCoreImpl() : d(new DufsCorePrivate(this))
 {
     // A damaged servers.json must never stop the module from loading.
-    try { d->load(); }
+    try {
+        d->load();
+        d->loadStorage();
+        // The node elsewhere was the last one open, but is no longer set: this computer's instead.
+        if (d->currentId == kStorageNodeId && d->nodes[kRemote].url.empty()) d->currentId = kStorageId;
+    }
     catch (const std::exception& e) { std::fprintf(stderr, "[dufs_core] load: %s\n", e.what()); d->servers.clear(); d->currentId.clear(); }
 }
 
@@ -897,6 +1778,14 @@ std::string DufsCoreImpl::removeServer(const std::string& id)
 
 std::string DufsCoreImpl::selectServer(const std::string& id)
 {
+    if (d->nodeOfServer(id) >= 0) {
+        d->currentId = id;
+        d->path = "/";
+        d->query.clear();
+        d->save();
+        d->list();
+        return d->state().dump();
+    }
     Server* s = d->find(id);
     if (!s) return json({{"ok", false}, {"error", "No such server."}}).dump();
     d->currentId = id;
@@ -909,6 +1798,7 @@ std::string DufsCoreImpl::selectServer(const std::string& id)
 
 std::string DufsCoreImpl::openDir(const std::string& path)
 {
+    if (d->onStorage()) { d->query.clear(); d->list(); return d->state().dump(); }
     d->path = normDir(path);
     d->query.clear();
     if (Server* s = d->current()) { s->lastPath = d->path; d->save(); }
@@ -931,6 +1821,7 @@ std::string DufsCoreImpl::search(const std::string& query)
 
 std::string DufsCoreImpl::makeDir(const std::string& name)
 {
+    if (d->onStorage()) return json({{"ok", false}, {"error", "Logos Storage has no folders."}}).dump();
     if (!d->current()) return json({{"ok", false}, {"error", "Add a server first."}}).dump();
     if (name.empty() || name.find('/') != std::string::npos)
         return json({{"ok", false}, {"error", "Folder names cannot be empty or contain /."}}).dump();
@@ -940,6 +1831,11 @@ std::string DufsCoreImpl::makeDir(const std::string& name)
 
 std::string DufsCoreImpl::removePath(const std::string& path)
 {
+    if (d->onStorage()) {
+        const json* e = d->entryFor(path);
+        if (!e) return json({{"ok", false}, {"error", "Not in Storage any more."}}).dump();
+        return storageRemove(jstr(*e, "cid", ""));
+    }
     if (!d->current()) return json({{"ok", false}, {"error", "Add a server first."}}).dump();
     if (path.empty() || path == "/") return json({{"ok", false}, {"error", "Refusing to delete the server root."}}).dump();
     d->simpleOp("DELETE", path, "", "Deleted " + baseName(path));
@@ -948,6 +1844,7 @@ std::string DufsCoreImpl::removePath(const std::string& path)
 
 std::string DufsCoreImpl::renamePath(const std::string& path, const std::string& newName)
 {
+    if (d->onStorage()) return json({{"ok", false}, {"error", "A file in Storage can't be renamed: its name is part of its CID."}}).dump();
     if (!d->current()) return json({{"ok", false}, {"error", "Add a server first."}}).dump();
     if (newName.empty() || newName.find('/') != std::string::npos)
         return json({{"ok", false}, {"error", "Names cannot be empty or contain /."}}).dump();
@@ -959,6 +1856,7 @@ std::string DufsCoreImpl::renamePath(const std::string& path, const std::string&
 
 std::string DufsCoreImpl::upload(const std::string& localPathsJson)
 {
+    if (d->onStorage()) return storageUpload(localPathsJson);
     Server* s = d->current();
     if (!s) return json({{"ok", false}, {"error", "Add a server first."}}).dump();
     json list = json::parse(localPathsJson, nullptr, false);
@@ -992,6 +1890,11 @@ std::string DufsCoreImpl::upload(const std::string& localPathsJson)
 
 std::string DufsCoreImpl::download(const std::string& path, const std::string& localPath)
 {
+    if (d->onStorage()) {
+        const json* e = d->entryFor(path);
+        if (!e) return json({{"ok", false}, {"error", "Not in Storage any more."}}).dump();
+        return storageDownload(jstr(*e, "cid", ""), localPath);
+    }
     Server* s = d->current();
     if (!s) return json({{"ok", false}, {"error", "Add a server first."}}).dump();
     const std::string local = localPathFrom(localPath);
@@ -1015,7 +1918,55 @@ std::string DufsCoreImpl::cancelTransfer(const std::string& id)
     Transfer* t = d->transfer(id);
     if (!t) return json({{"ok", false}, {"error", "No such transfer."}}).dump();
     if (t->state == "queued") t->state = "cancelled";
-    else if (t->state == "running") { t->state = "cancelled"; if (t->reply) t->reply->abort(); }
+    else if (t->state == "running") {
+        t->state = "cancelled";
+        if (t->reply) t->reply->abort();
+        // A Storage session: told to stop; its temp file goes.
+        if (!t->session.empty()) {
+            const std::string sess = t->session;
+            d->stSessions.erase(DufsCorePrivate::sessKey(t->node, sess));
+            const bool upload = t->uploading();
+            if (t->phase == "storage")
+                d->withStorage(t->node, [&](auto& sm) {
+                    if (upload) sm.uploadCancelAsyncResult(sess, [](logos::AsyncResult<StdLogosResult>) {}, kStorageCallMs);
+                    else sm.downloadCancelAsyncResult(sess, [](logos::AsyncResult<StdLogosResult>) {}, kStorageCallMs);
+                });
+        }
+        if (t->phase != "http") { std::error_code ec; if (!t->storagePath.empty() && t->kind == "fetch") fs::remove(t->storagePath, ec); d->cleanTmp(*t); }
+    }
+    d->storageEntries();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::retryTransfer(const std::string& id)
+{
+    Transfer* t = d->transfer(id);
+    if (!t) return json({{"ok", false}, {"error", "No such transfer."}}).dump();
+    if (t->state != "failed" && t->state != "cancelled") return json({{"ok", false}, {"error", "It is still running."}}).dump();
+    if (t->reply) return json({{"ok", false}, {"error", "It is still stopping; try again in a moment."}}).dump();
+    // From the start: the same file, the same target, a fresh attempt.
+    t->state = "running";
+    t->error.clear();
+    t->done = 0;
+    t->tries = 0;
+    t->session.clear();
+    t->started = QDateTime::currentMSecsSinceEpoch();
+    const std::string tid = t->id;
+    if (t->kind == "upload") { t->state = "queued"; d->pumpUploads(); }
+    else if (t->kind == "download") d->startDownload(*t, !t->path.empty() && t->path.back() == '/');
+    else if (t->kind == "store") { d->ensureStorage(t->node); d->storeFile(tid, t->local); }
+    else if (t->kind == "promote") { d->ensureStorage(t->node); d->startPromote(*t); }
+    else if (t->kind == "fetch") { d->ensureStorage(t->node); d->fetchFile(tid, t->cid, t->local + ".part"); }
+    else if (t->kind == "add" || t->kind == "demote" || t->kind == "copy") {
+        if (t->kind == "copy" && t->copyUp) { t->node = t->copyTo == kLocal ? kRemote : kLocal; t->copyUp = false; }
+        if (t->kind == "add") t->tmp = d->storageTmp(tid) + "/data";
+        ensurePrivateDir(d->storageTmp(tid));
+        d->ensureStorage(t->node);
+        if (t->kind == "copy") d->ensureStorage(t->copyTo);
+        d->fetchFile(tid, t->cid, t->tmp);
+    } else { t->state = "failed"; t->error = "This kind of transfer can't be retried."; }
+    d->storageEntries();
     d->changed();
     return d->state().dump();
 }
@@ -1031,7 +1982,7 @@ std::string DufsCoreImpl::clearTransfers()
 
 static std::string placeError(const std::string& serverId, const std::string& path, DufsCorePrivate* d)
 {
-    if (!d->find(serverId)) return json({{"ok", false}, {"error", "No such server."}}).dump();
+    if (!d->find(serverId) && d->nodeOfServer(serverId) < 0) return json({{"ok", false}, {"error", "No such server."}}).dump();
     if (path.empty() || path[0] != '/') return json({{"ok", false}, {"error", "Not a path on the server."}}).dump();
     return "";
 }
@@ -1152,4 +2103,208 @@ std::string DufsCoreImpl::openUrl(const std::string& url)
     // It hands the link to the browser and exits; reaped so it is no zombie.
     std::thread([pid]() { ::waitpid(pid, nullptr, 0); }).detach();
     return json({{"ok", true}}).dump();
+}
+
+// ── Logos Storage ───────────────────────────────────────────────────────────
+
+static std::string cleanCid(std::string c)
+{
+    while (!c.empty() && std::isspace((unsigned char)c.back())) c.pop_back();
+    size_t i = 0;
+    while (i < c.size() && std::isspace((unsigned char)c[i])) i++;
+    c = c.substr(i);
+    // A CID is base-encoded: letters and digits only (anything else would land in a path).
+    if (c.empty() || c.size() > 200) return "";
+    for (unsigned char ch : c) if (!std::isalnum(ch)) return "";
+    return c;
+}
+
+std::string DufsCoreImpl::storageRefresh()
+{
+    const int n = d->activeNode();
+    d->ensureStorage(n);
+    d->listStorage(n);
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::storageUpload(const std::string& localPathsJson)
+{
+    const int n = d->activeNode();
+    d->ensureStorage(n);
+    json list = json::parse(localPathsJson, nullptr, false);
+    if (list.is_string()) list = json::array({list});
+    if (!list.is_array()) return json({{"ok", false}, {"error", "Nothing to put into Storage."}}).dump();
+    int added = 0;
+    for (auto& item : list) {
+        if (!item.is_string()) continue;
+        const std::string local = localPathFrom(item.get<std::string>());
+        QFileInfo fi(QString::fromStdString(local));
+        if (!fi.isFile()) continue;
+        Transfer& t = d->newStorageTransfer(n, "store", fi.fileName().toStdString());
+        t.local = local;
+        t.from = "this computer";
+        const std::string id = t.id;
+        d->storeFile(id, local);
+        added++;
+    }
+    if (!added) return json({{"ok", false}, {"error", "Only files go into Storage (no folders yet)."}}).dump();
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::storageDownload(const std::string& cidIn, const std::string& localPath)
+{
+    const std::string cid = cleanCid(cidIn);
+    if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID."}}).dump();
+    const std::string local = localPathFrom(localPath);
+    if (local.empty()) return json({{"ok", false}, {"error", "Choose where to save it."}}).dump();
+    if (d->storageBusy(cid, d->activeNode())) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    const int n = d->activeNode();
+    d->ensureStorage(n);
+    Transfer& t = d->newStorageTransfer(n, "fetch", baseName(local));
+    t.local = local;
+    const std::string id = t.id;
+    d->fetchFile(id, cid, local + ".part");
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::storageAdd(const std::string& cidIn)
+{
+    const std::string cid = cleanCid(cidIn);
+    if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID. It looks like zDvZ… or bafy…"}}).dump();
+    if (d->storageBusy(cid, d->activeNode())) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    const int n = d->activeNode();
+    d->ensureStorage(n);
+    Transfer& t = d->newStorageTransfer(n, "add", cid.substr(0, 12) + "…");
+    const std::string id = t.id;
+    ensurePrivateDir(d->storageTmp(id));
+    t.tmp = d->storageTmp(id) + "/data";
+    d->fetchFile(id, cid, t.tmp);
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::storageCopy(const std::string& cidIn, const std::string& toStorageId)
+{
+    const std::string cid = cleanCid(cidIn);
+    if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID."}}).dump();
+    const int from = d->activeNode(), to = d->nodeOfServer(toStorageId);
+    if (to < 0) return json({{"ok", false}, {"error", "No such Storage node."}}).dump();
+    if (to == from) return json({{"ok", false}, {"error", "It is already there."}}).dump();
+    if (d->nodes[from].incomplete.count(cid)) return json({{"ok", false}, {"error", "Its data hasn't arrived here yet."}}).dump();
+    if (d->storageBusy(cid, to)) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    std::string name = cid;
+    for (auto& f : d->nodes[from].files) if (jstr(f, "cid", "") == cid && !jstr(f, "name", "").empty()) name = jstr(f, "name", "");
+    if (name.find('/') != std::string::npos) name = baseName(name);
+    d->ensureStorage(from);
+    d->ensureStorage(to);
+    // Through this computer: read from the one node into a temp file under the file's name (the CID
+    // includes it), then upload that into the other. No peer-to-peer path between the nodes needed.
+    Transfer& t = d->newStorageTransfer(from, "copy", name);
+    t.copyTo = to;
+    const std::string id = t.id;
+    ensurePrivateDir(d->storageTmp(id));
+    t.tmp = d->storageTmp(id) + "/" + name;
+    d->fetchFile(id, cid, t.tmp);
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::storageRemove(const std::string& cidIn)
+{
+    const std::string cid = cleanCid(cidIn);
+    if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID."}}).dump();
+    const int n = d->activeNode();
+    d->ensureStorage(n);
+    d->withStorage(n, [&](auto& sm) { sm.removeAsyncResult(cid, [this, cid, n](logos::AsyncResult<StdLogosResult> ar) {
+        const bool ok = ar.ok() && ar.value.success;
+        const std::string err = !ar.ok() ? "Logos Storage did not answer." : ar.value.error;
+        d->onLoop([this, ok, err, cid, n] {
+            if (!ok) { d->note("Could not remove it from Storage: " + err, "error"); d->changed(); return; }
+            if (d->nodes[n].incomplete.erase(cid)) d->saveStorage();
+            d->note("Removed from " + d->nodeName(n), "ok");
+            d->listStorage(n);
+        });
+    }, kStorageCallMs); });
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::sendToStorage(const std::string& serverId, const std::string& path, const std::string& storageId)
+{
+    const int n = storageId.empty() ? kLocal : d->nodeOfServer(storageId);
+    if (n < 0) return json({{"ok", false}, {"error", "No such Storage node."}}).dump();
+    Server* s = d->find(serverId);
+    if (!s) return json({{"ok", false}, {"error", "No such server."}}).dump();
+    if (path.empty() || path[0] != '/') return json({{"ok", false}, {"error", "Not a path on the server."}}).dump();
+    if (path.back() == '/') return json({{"ok", false}, {"error", "Only files go into Storage (no folders yet)."}}).dump();
+    d->ensureStorage(n);
+    Transfer& t = d->newStorageTransfer(n, "promote", baseName(path));
+    t.serverId = serverId;
+    t.path = path;
+    t.from = s->name + ":" + path;
+    d->startPromote(t);
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::saveToServer(const std::string& cidIn, const std::string& serverId, const std::string& dir)
+{
+    const std::string cid = cleanCid(cidIn);
+    if (cid.empty()) return json({{"ok", false}, {"error", "That is not a CID."}}).dump();
+    Server* s = d->find(serverId);
+    if (!s) return json({{"ok", false}, {"error", "No such server."}}).dump();
+    if (d->storageBusy(cid, d->activeNode())) return json({{"ok", false}, {"error", "That file is already on its way."}}).dump();
+    // The file's name in Storage, else the CID.
+    std::string name = cid;
+    const int n = d->activeNode();
+    for (auto& f : d->nodes[n].files) if (jstr(f, "cid", "") == cid && !jstr(f, "name", "").empty()) name = jstr(f, "name", "");
+    if (name.find('/') != std::string::npos) name = baseName(name);
+    d->ensureStorage(n);
+    Transfer& t = d->newStorageTransfer(n, "demote", name);
+    t.serverId = serverId;
+    t.path = normDir(dir) + name;
+    const std::string id = t.id;
+    ensurePrivateDir(d->storageTmp(id));
+    t.tmp = d->storageTmp(id) + "/" + name;
+    d->fetchFile(id, cid, t.tmp);
+    return d->state().dump();
+}
+
+std::string DufsCoreImpl::storageSettings(const std::string& settingsJson)
+{
+    json s = json::parse(settingsJson, nullptr, false);
+    if (!s.is_object()) return json({{"ok", false}, {"error", "Bad settings."}}).dump();
+    if (s.contains("advertise") && s["advertise"].is_boolean()) d->stAdvertise = s["advertise"].get<bool>();
+    // "node": "" = this computer's Storage node, else a node's REST url (through storage_gateway).
+    if (s.contains("node") && s["node"].is_string()) {
+        std::string node = s["node"].get<std::string>();
+        node.erase(0, node.find_first_not_of(" \t"));
+        while (!node.empty() && (node.back() == ' ' || node.back() == '/')) node.pop_back();
+        if (!node.empty() && node.rfind("http://", 0) != 0)
+            return json({{"ok", false}, {"error", "A Storage node's address starts with http:// (over your VPN or mesh)."}}).dump();
+        auto& R = d->nodes[kRemote];
+        if (node != R.url) {
+            // Another node (or none): its files are listed afresh. Transfers already running finish
+            // against the gateway as it was.
+            const bool wasHere = d->currentId == kStorageNodeId;
+            R.url = node;
+            R.init = false;
+            R.state = "off";
+            R.error.clear();
+            R.files = json::array();
+            R.byName.clear();
+            R.size.clear();
+            R.incomplete.clear();
+            R.peerId.clear();
+            R.addrs = json::array();
+            d->saveStorage();
+            if (!node.empty()) {
+                d->ensureStorage(kRemote);
+                if (wasHere) d->list();
+            } else if (wasHere) {
+                // The node is gone: back to this computer's.
+                d->currentId = kStorageId;
+                d->list();
+            }
+        }
+    }
+    d->saveStorage();
+    d->changed();
+    return d->state().dump();
 }

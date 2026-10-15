@@ -4,6 +4,11 @@
   inputs = {
     # Basecamp 0.3.x: builder 0.3.1 (release tag).
     logos-module-builder.url = "github:logos-co/logos-module-builder/0.3.1";
+    # Logos Storage (the host's node on Basecamp 0.3). Pinned: master once pulled in an API break.
+    # v3.0.1's API is the one 3.0.2 and the 3.0.3 fork (libstorage download fix) have too.
+    storage_module.url = "github:logos-co/logos-storage-module/v3.0.1";
+    # The same API, served by a Storage node elsewhere (its REST API): Settings → Storage node.
+    storage_gateway.url = "github:vpavlin/logos-storage-gateway/585aba6d22916895856f6830822e04e981b5f51e?dir=module";
   };
 
   outputs = inputs@{ logos-module-builder, ... }:
