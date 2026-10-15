@@ -257,13 +257,15 @@ Item {
     readonly property bool coreLost: root.coreSeen && root.missedPolls >= 4
 
     readonly property var servers: st.servers || []
-    // Logos Storage: shown in place of a server when picked in the sidebar.
-    property bool storageMode: false
+    // The dufs servers only (Logos Storage is in the list too, as one more place).
+    readonly property var dufsServers: servers.filter(function (s) { return !s.storage })
+    readonly property bool isStorage: !!root.currentServer && !!root.currentServer.storage
     readonly property var storage: st.storage || ({ state: "off", files: [] })
     readonly property string storageLine: {
         var s = root.storage, n = (s.files || []).length
         if (s.state === "error") return s.error || "Not available"
-        if (s.state === "starting" || s.state === "off") return "Starting…"
+        if (s.state === "off") return "Files by CID, " + root.storageWhere
+        if (s.state === "starting") return "Starting…"
         return (n === 1 ? "1 file " : n + " files ") + root.storageWhere
     }
     // Where the files are: this computer's node, or a node elsewhere (through storage_gateway).
@@ -273,16 +275,10 @@ Item {
         var m = /^http:\/\/(\[[^\]]+\]|[^\/:]+)/.exec(root.storageNode)
         return "on the node at " + (m ? m[1] : root.storageNode)
     }
-    function openStorage() {
-        root.storageMode = true
-        root.selectedPath = ""
-        act("storageRefresh", [])
-    }
-    function storeUrls(urls) {
-        var list = []
-        for (var i = 0; i < urls.length; i++) list.push(String(urls[i]))
-        if (!list.length) return
-        act("storageUpload", [JSON.stringify(list)], list.length === 1 ? "Putting 1 file into Storage" : "Putting " + list.length + " files into Storage")
+    // "from pi5 · " / "added by CID · " before a CID, as the core recorded where a file came from.
+    function storageOrigin(e) {
+        if (!e || !e.from) return ""
+        return (/^(added|by CID)/.test(e.from) ? e.from : "from " + e.from) + "  ·  "
     }
     function sendToStorage(e) {
         if (!e || e.dir || !root.st.current) return
@@ -335,6 +331,12 @@ Item {
             root.lastNoticeAt = obj.noticeAt
         } else if (root.lastNoticeAt === 0) root.lastNoticeAt = obj.noticeAt || 1
         if (!obj.previewCache) registerViewDir()
+        // A relisting (↻, another node) drops the core's previews: forget asking for those, and ask
+        // again for the open file's.
+        var req = root.requested, pv = obj.previews || {}, dropped = false
+        for (var k in req) if (!pv[k]) { delete req[k]; dropped = true }
+        if (dropped) root.requested = req
+        if (root.selectedEntry && !pv[root.selectedEntry.path]) Qt.callLater(function () { root.wantPreview(root.selectedEntry) })
         if (root.pendingIntents.length) {
             var q = root.pendingIntents; root.pendingIntents = []
             for (var i = 0; i < q.length; i++) handleIntent(q[i][0], q[i][1], q[i][2])
@@ -432,6 +434,15 @@ Item {
     function baseName(path) {
         var s = String(path || "").replace(/\/$/, "")
         return s.substring(s.lastIndexOf("/") + 1) || "/"
+    }
+    // A pinned/recent place's label: its name; a file in Storage ("/<cid>") by the file's name.
+    function placeName(pl) {
+        if (pl && pl.server === "logos-storage") {
+            var cid = String(pl.path).replace(/^\//, ""), f = root.storage.files || []
+            for (var i = 0; i < f.length; i++) if (f[i].cid === cid) return f[i].name
+            return cid.length > 14 ? cid.substring(0, 6) + "…" + cid.substring(cid.length - 6) : cid
+        }
+        return pl ? root.baseName(pl.path) : ""
     }
     function serverName(id) {
         var s = root.servers
@@ -548,6 +559,7 @@ Item {
         var list = []
         for (var i = 0; i < urls.length; i++) list.push(String(urls[i]))
         if (!list.length) return
+        if (root.isStorage) { uploadNow(list); return }
         var existing = {}
         var es = root.st.entries || []
         for (var k = 0; k < es.length; k++) if (!es[k].dir) existing[es[k].name] = true
@@ -712,11 +724,11 @@ Item {
                         width: ListView.view.width
                         height: 52
                         radius: 8
-                        readonly property bool active: modelData.id === root.st.current && !root.storageMode
+                        readonly property bool active: modelData.id === root.st.current
                         color: active ? root.cRaised : (sMouse.containsMouse ? Qt.darker(root.cRaised, 1.15) : "transparent")
                         border.width: active ? 1 : 0
                         border.color: root.cAccent
-                        MouseArea { id: sMouse; anchors.fill: parent; hoverEnabled: true; onClicked: if (!parent.active) { root.storageMode = false; root.selectedPath = ""; root.requested = ({}); if (modelData.id !== root.st.current) root.act("selectServer", [modelData.id]) } }
+                        MouseArea { id: sMouse; anchors.fill: parent; hoverEnabled: true; onClicked: if (!parent.active) { root.selectedPath = ""; root.requested = ({}); if (modelData.id !== root.st.current) root.act("selectServer", [modelData.id]) } }
                         ColumnLayout {
                             anchors.fill: parent
                             anchors.leftMargin: 10
@@ -724,41 +736,21 @@ Item {
                             spacing: 0
                             Item { Layout.fillHeight: true }
                             Text { text: modelData.name; color: root.cText; font.pixelSize: 14; font.bold: active; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
-                            Text { text: modelData.url.replace(/^https?:\/\//, "") + (modelData.user ? "  ·  " + modelData.user : ""); color: root.cFaint; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
+                            Text {
+                                text: modelData.storage ? root.storageLine : modelData.url.replace(/^https?:\/\//, "") + (modelData.user ? "  ·  " + modelData.user : "")
+                                color: modelData.storage && root.storage.state === "error" ? root.cBad : root.cFaint
+                                font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText
+                            }
                             Item { Layout.fillHeight: true }
                         }
                         Text {
                             anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter
                             text: "⋯"; color: root.cSub; font.pixelSize: 18; textFormat: Text.PlainText
-                            MouseArea { anchors.fill: parent; anchors.margins: -6; onClicked: serverDialog.openFor(modelData) }
+                            MouseArea { anchors.fill: parent; anchors.margins: -6; onClicked: modelData.storage ? nodeDialog.open() : serverDialog.openFor(modelData) }
                         }
                     }
                 }
                 LogosButton { text: "+ Add server"; Layout.fillWidth: true; onClicked: serverDialog.openFor(null) }
-                // Logos Storage, as one more place beside the servers.
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.topMargin: root.sp
-                    height: 52
-                    radius: 8
-                    color: root.storageMode ? root.cRaised : (lsMouse.containsMouse ? Qt.darker(root.cRaised, 1.15) : "transparent")
-                    border.width: root.storageMode ? 1 : 0
-                    border.color: root.cAccent
-                    MouseArea { id: lsMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.openStorage() }
-                    ColumnLayout {
-                        anchors.fill: parent
-                        anchors.leftMargin: 10
-                        anchors.rightMargin: 10
-                        spacing: 0
-                        Item { Layout.fillHeight: true }
-                        Text { text: "Logos Storage"; color: root.cText; font.pixelSize: 14; font.bold: root.storageMode; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
-                        Text {
-                            text: root.storage.state === "off" ? "Files by CID, " + root.storageWhere : root.storageLine
-                            color: root.storage.state === "error" ? root.cBad : root.cFaint; font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText
-                        }
-                        Item { Layout.fillHeight: true }
-                    }
-                }
 
                 // Pinned and Recent: click to open; a pinned row's ✕ unpins, a recent row's ☆ pins it.
                 ListView {
@@ -779,7 +771,7 @@ Item {
                             m.push({ hdr: "RECENT", clear: true })
                             root.recent.forEach(function (x) { m.push({ place: x, pinned: false }) })
                         }
-                        if (!m.length && root.servers.length)
+                        if (!m.length && root.dufsServers.length)
                             m.push({ hint: "Pin a file or folder from its ⋯ menu or the ☆ in the toolbar. Files you open show up here as Recent." })
                         return m
                     }
@@ -820,7 +812,7 @@ Item {
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: { root.storageMode = false; root.openPlace(pRow.pl.server, pRow.pl.path) }
+                                onClicked: root.openPlace(pRow.pl.server, pRow.pl.path)
                             }
                             Text {
                                 id: pGlyph
@@ -834,13 +826,14 @@ Item {
                                 anchors.right: parent.right; anchors.rightMargin: 28
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 0
-                                Text { text: pRow.pl ? root.baseName(pRow.pl.path) : ""; color: root.cText; font.pixelSize: 13; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
+                                Text { text: root.placeName(pRow.pl); color: root.cText; font.pixelSize: 13; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
                                 Text {
                                     text: {
                                         if (!pRow.pl) return ""
                                         var p = pRow.pl.path.replace(/\/$/, "")
                                         var dir = p.substring(0, p.lastIndexOf("/") + 1) || "/"
-                                        return (root.servers.length > 1 ? root.serverName(pRow.pl.server) + "  ·  " : "") + dir
+                                        if (pRow.pl.server === "logos-storage") return "Logos Storage"
+                                        return (root.dufsServers.length > 1 ? root.serverName(pRow.pl.server) + "  ·  " : "") + dir
                                     }
                                     color: root.cFaint; font.pixelSize: 10; elide: Text.ElideLeft; Layout.fillWidth: true; textFormat: Text.PlainText
                                 }
@@ -877,7 +870,6 @@ Item {
 
             // toolbar
             Rectangle {
-                visible: !root.storageMode
                 Layout.fillWidth: true
                 Layout.preferredHeight: 56
                 color: root.cBg
@@ -970,6 +962,7 @@ Item {
                     }
                     // Pin the folder you're in.
                     LogosButton {
+                        visible: !root.isStorage
                         Layout.preferredWidth: 38; Layout.preferredHeight: 34
                         enabled: !!root.currentServer
                         readonly property bool on: root.isPinned(root.st.path || "/")
@@ -978,14 +971,15 @@ Item {
                         ToolTip.text: on ? "Unpin this folder" : "Pin this folder"
                         onClicked: root.togglePin(root.st.path || "/")
                     }
-                    LogosButton { Layout.preferredWidth: 80; Layout.preferredHeight: 34; text: "Go to…"; enabled: !!root.currentServer; onClicked: root.startAddress() }
+                    LogosButton { visible: !root.isStorage; Layout.preferredWidth: 80; Layout.preferredHeight: 34; text: "Go to…"; enabled: !!root.currentServer; onClicked: root.startAddress() }
+                    LogosButton { visible: root.isStorage; Layout.preferredWidth: 110; Layout.preferredHeight: 34; text: "Add by CID"; onClicked: cidDialog.open() }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: root.gridMode ? "List" : "Grid"; enabled: !!root.currentServer; onClicked: root.gridMode = !root.gridMode }
-                    LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "New folder"; enabled: !!root.currentServer && !root.st.error && root.st.perms.upload === true && !root.st.query; onClicked: nameDialog.ask("New folder", "", function (n) { root.act("makeDir", [n]) }) }
+                    LogosButton { visible: !root.isStorage; Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "New folder"; enabled: !!root.currentServer && !root.st.error && root.st.perms.upload === true && !root.st.query; onClicked: nameDialog.ask("New folder", "", function (n) { root.act("makeDir", [n]) }) }
                     LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Upload"; enabled: !!root.currentServer && !root.st.error && root.st.perms.upload === true && !root.st.query; onClicked: uploadDialog.open() }
                     LogosButton { Layout.preferredWidth: 44; Layout.preferredHeight: 34; text: "↻"; enabled: !!root.currentServer; onClicked: root.act("refresh", []) }
                 }
             }
-            Rectangle { visible: !root.storageMode; Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
+            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
 
             Rectangle {
                 Layout.fillWidth: true
@@ -1006,7 +1000,6 @@ Item {
 
             // listing + preview
             RowLayout {
-                visible: !root.storageMode
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 spacing: 0
@@ -1058,7 +1051,7 @@ Item {
                         delegate: Rectangle {
                             required property var modelData
                             width: listView.width
-                            height: 40
+                            height: modelData.cid ? 48 : 40
                             readonly property bool sel: modelData.path === root.selectedPath
                             color: sel ? root.cRaised : (rowMouse.containsMouse ? root.cSurface : "transparent")
                             MouseArea {
@@ -1078,7 +1071,11 @@ Item {
                                     Layout.fillWidth: true
                                     spacing: 0
                                     Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
-                                    Text { visible: !!root.st.query && modelData.rel !== modelData.name; text: modelData.rel || ""; color: root.cFaint; font.pixelSize: 11; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
+                                    Text {
+                                        visible: !!modelData.cid || (!!root.st.query && modelData.rel !== modelData.name)
+                                        text: modelData.cid ? root.storageOrigin(modelData) + modelData.cid : (modelData.rel || "")
+                                        color: root.cFaint; font.pixelSize: 11; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText
+                                    }
                                 }
                                 Text { text: root.fmtSize(modelData.size, modelData.dir); color: root.cSub; font.pixelSize: 12; Layout.preferredWidth: 90; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
                                 Text { text: root.fmtDate(modelData.mtime); color: root.cFaint; font.pixelSize: 12; Layout.preferredWidth: 140; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
@@ -1205,6 +1202,7 @@ Item {
                                 : !root.currentServer ? "Add a dufs server to start"
                                 : root.st.error ? root.st.error
                                 : root.st.query ? "Nothing matches “" + root.st.query + "”"
+                                : root.isStorage ? "Nothing in Logos Storage yet"
                                 : "This folder is empty"
                         }
                         Text {
@@ -1216,8 +1214,10 @@ Item {
                             font.pixelSize: 13
                             text: !root.coreSeen ? (root.missedPolls > 3 ? "No answer yet. Make sure the Dufs Core module is installed." : "")
                                 : !root.currentServer ? "For example http://pi5.lan:5000. Start dufs with -A to allow uploads, deletes and search."
-                                : root.st.error ? (root.currentServer ? root.currentServer.url : "")
-                                : root.st.query ? "" : (root.st.perms.upload !== false ? "Drop files here to upload them." : "")
+                                : root.st.error ? (root.isStorage ? "Basecamp starts Storage a moment after it opens; with a node elsewhere, check its address (⋯ beside Logos Storage)." : root.currentServer ? root.currentServer.url : "")
+                                : root.st.query ? ""
+                                : root.isStorage ? "Drop files here, upload them, send a file from a dufs server (its ⋯ menu), or add one someone shared by its CID."
+                                : (root.st.perms.upload !== false ? "Drop files here to upload them." : "")
                         }
                         LogosButton {
                             anchors.horizontalCenter: parent.horizontalCenter
@@ -1255,7 +1255,7 @@ Item {
                         border.color: root.cAccent
                         Text {
                             anchors.centerIn: parent
-                            text: "Drop to upload to " + (root.st.path || "/")
+                            text: root.isStorage ? "Drop to put into Logos Storage" : "Drop to upload to " + (root.st.path || "/")
                             color: root.cText
                             font.pixelSize: 18
                             font.bold: true
@@ -1281,8 +1281,21 @@ Item {
                             Text { text: "✕"; color: root.cSub; font.pixelSize: 15; textFormat: Text.PlainText; MouseArea { anchors.fill: parent; anchors.margins: -6; onClicked: root.selectedPath = "" } }
                         }
                         Text {
-                            text: root.selectedEntry ? root.fmtSize(root.selectedEntry.size, false) + "  ·  " + root.fmtDate(root.selectedEntry.mtime) : ""
+                            text: root.selectedEntry ? root.fmtSize(root.selectedEntry.size, false) + (root.selectedEntry.mtime ? "  ·  " + root.fmtDate(root.selectedEntry.mtime) : "") : ""
                             color: root.cFaint; font.pixelSize: 12; textFormat: Text.PlainText
+                        }
+                        // In Storage: where it came from, and its CID (select to copy).
+                        TextEdit {
+                            visible: !!root.selectedEntry && !!root.selectedEntry.cid
+                            Layout.fillWidth: true
+                            readOnly: true
+                            selectByMouse: true
+                            wrapMode: TextEdit.WrapAnywhere
+                            color: root.cFaint
+                            selectionColor: root.cAccent
+                            font.pixelSize: 11
+                            textFormat: TextEdit.PlainText
+                            text: root.selectedEntry && root.selectedEntry.cid ? root.storageOrigin(root.selectedEntry) + root.selectedEntry.cid : ""
                         }
                         Row {
                             visible: (root.isMarkdown(root.selectedEntry) || root.isHtml(root.selectedEntry)) && !!root.selectedPreview && !!root.selectedPreview.text
@@ -1399,162 +1412,17 @@ Item {
                             columnSpacing: root.sp
                             rowSpacing: root.sp
                             LogosButton { Layout.fillWidth: true; text: "Download"; onClicked: { root.askSave(root.selectedEntry) } }
-                            LogosButton { Layout.fillWidth: true; text: "Open in browser"; onClicked: root.openUrl(root.selectedEntry.url) }
-                            LogosButton { Layout.fillWidth: true; text: "Copy link"; onClicked: root.copyText(root.selectedEntry.url) }
-                            LogosButton { Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
-                            LogosButton { Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
+                            LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Open in browser"; onClicked: root.openUrl(root.selectedEntry.url) }
+                            LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Copy link"; onClicked: root.copyText(root.selectedEntry.url) }
+                            LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Copy Basecamp link"; onClicked: root.copyText(root.basecampLink(root.selectedEntry.url)) }
+                            LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "Copy CID"; onClicked: root.copyText(root.selectedEntry.cid) }
+                            LogosButton { visible: root.isStorage; Layout.fillWidth: true; text: "To a dufs server…"; enabled: root.dufsServers.length > 0; onClicked: toServerDialog.ask(root.selectedEntry) }
+                            LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "Rename"; enabled: root.st.perms.delete !== false; onClicked: { var e = root.selectedEntry; nameDialog.ask("Rename", e.name, function (n) { root.selectedPath = ""; root.act("renamePath", [e.path, n]) }) } }
                             LogosButton { Layout.fillWidth: true; text: "Delete"; enabled: root.st.perms.delete !== false; onClicked: confirmDialog.ask(root.selectedEntry) }
                             LogosButton { Layout.fillWidth: true; text: !!root.selectedEntry && root.isPinned(root.selectedEntry.path) ? "Unpin" : "Pin"; onClicked: root.togglePin(root.selectedEntry.path) }
-                            LogosButton { Layout.fillWidth: true; text: "To Logos Storage"; onClicked: root.sendToStorage(root.selectedEntry) }
+                            LogosButton { visible: !root.isStorage; Layout.fillWidth: true; text: "To Logos Storage"; onClicked: root.sendToStorage(root.selectedEntry) }
                         }
                     }
-                }
-            }
-
-            // Logos Storage: what this computer's node holds
-            ColumnLayout {
-                visible: root.storageMode
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                spacing: 0
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 56
-                    color: root.cBg
-                    RowLayout {
-                        anchors.fill: parent
-                        anchors.leftMargin: root.sp * 2
-                        anchors.rightMargin: root.sp * 2
-                        spacing: root.sp
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 0
-                            Text { text: "Logos Storage"; color: root.cText; font.pixelSize: 15; font.bold: true; textFormat: Text.PlainText }
-                            Text {
-                                text: root.storageLine
-                                color: root.storage.state === "error" ? root.cBad : root.cFaint
-                                font.pixelSize: 11; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText
-                            }
-                        }
-                        CheckBox {
-                            id: announceBox
-                            checked: root.storage.advertise !== false
-                            onToggled: { root.act("storageSettings", [JSON.stringify({ advertise: checked })]); checked = Qt.binding(function () { return root.storage.advertise !== false }) }
-                            ToolTip.visible: hovered; ToolTip.delay: 500
-                            ToolTip.text: "Announce what you put into Storage, so others can fetch it by its CID. Off: it stays " + root.storageWhere + " only."
-                        }
-                        Text {
-                            text: "Announce"; color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
-                            Layout.leftMargin: -root.sp
-                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: announceBox.toggle(), announceBox.toggled() }
-                        }
-                        LogosButton { Layout.preferredWidth: 80; Layout.preferredHeight: 34; text: "Node…"; onClicked: nodeDialog.open() }
-                        LogosButton { Layout.preferredWidth: 110; Layout.preferredHeight: 34; text: "Add by CID"; onClicked: cidDialog.open() }
-                        LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Upload"; onClicked: storageUploadDialog.open() }
-                        LogosButton { Layout.preferredWidth: 44; Layout.preferredHeight: 34; text: "↻"; onClicked: root.act("storageRefresh", []) }
-                    }
-                }
-                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: root.cLine }
-                Item {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    ListView {
-                        id: storageList
-                        anchors.fill: parent
-                        clip: true
-                        model: root.storage.files || []
-                        ScrollBar.vertical: ScrollBar {}
-                        delegate: Rectangle {
-                            required property var modelData
-                            width: storageList.width
-                            height: 48
-                            color: stMouse.containsMouse ? root.cSurface : "transparent"
-                            MouseArea {
-                                id: stMouse
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                                onClicked: storageMenu.popupFor(modelData)
-                            }
-                            RowLayout {
-                                anchors.fill: parent
-                                anchors.leftMargin: root.sp * 2
-                                anchors.rightMargin: root.sp * 2
-                                spacing: 12
-                                Text { text: root.glyph(modelData.kind); color: root.kindColor(modelData.kind); font.pixelSize: 18; Layout.preferredWidth: 22; horizontalAlignment: Text.AlignHCenter; textFormat: Text.PlainText }
-                                ColumnLayout {
-                                    Layout.fillWidth: true
-                                    spacing: 1
-                                    Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText }
-                                    Text {
-                                        text: (modelData.from ? (/^(added|by CID)/.test(modelData.from) ? modelData.from : "from " + modelData.from) + "  ·  " : "") + modelData.cid
-                                        color: root.cFaint; font.pixelSize: 11; elide: Text.ElideMiddle; Layout.fillWidth: true; textFormat: Text.PlainText
-                                    }
-                                }
-                                Text { text: root.fmtSize(modelData.size, false); color: root.cSub; font.pixelSize: 12; Layout.preferredWidth: 80; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
-                                Text { text: modelData.at ? root.fmtDate(modelData.at) : ""; color: root.cFaint; font.pixelSize: 12; Layout.preferredWidth: 120; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
-                                Text { text: "⋯"; color: root.cSub; font.pixelSize: 18; textFormat: Text.PlainText }
-                            }
-                        }
-                    }
-                    // empty, starting, error
-                    Column {
-                        anchors.centerIn: parent
-                        width: Math.min(parent.width - 48, 480)
-                        spacing: 12
-                        visible: (root.storage.files || []).length === 0
-                        Text {
-                            width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; textFormat: Text.PlainText
-                            color: root.storage.state === "error" ? root.cBad : root.cText
-                            font.pixelSize: 17
-                            text: root.storage.state === "error" ? root.storage.error
-                                : root.storage.state === "ready" ? "Nothing in Logos Storage yet"
-                                : "Starting Logos Storage…"
-                        }
-                        Text {
-                            width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; textFormat: Text.PlainText
-                            color: root.cFaint; font.pixelSize: 13
-                            visible: root.storage.state !== "starting"
-                            text: root.storage.state === "error" ? "Basecamp starts Storage a moment after it opens. If this stays, check that the Storage module is installed."
-                                : "Drop files here, upload them, send a file from a dufs server (its ⋯ menu), or add one someone shared by its CID."
-                        }
-                        LogosButton {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            visible: root.storage.state === "error"
-                            text: "Try again"
-                            onClicked: root.act("storageRefresh", [])
-                        }
-                    }
-                    DropArea {
-                        anchors.fill: parent
-                        onEntered: (drag) => { root.dropHover = drag.hasUrls; if (drag.hasUrls) drag.accept(Qt.CopyAction) }
-                        onExited: root.dropHover = false
-                        onDropped: (drop) => { root.dropHover = false; if (drop.hasUrls) { drop.accept(Qt.CopyAction); root.storeUrls(drop.urls) } }
-                    }
-                    Rectangle {
-                        anchors.fill: parent
-                        anchors.margins: 8
-                        visible: root.dropHover && root.storageMode
-                        radius: 12
-                        color: Qt.rgba(root.cAccent.r, root.cAccent.g, root.cAccent.b, 0.10)
-                        border.width: 2
-                        border.color: root.cAccent
-                        Text { anchors.centerIn: parent; text: "Drop to put into Logos Storage"; color: root.cText; font.pixelSize: 18; font.bold: true; textFormat: Text.PlainText }
-                    }
-                }
-                // What sharing through Storage means, once, where it applies.
-                Text {
-                    Layout.fillWidth: true
-                    Layout.margins: root.sp * 2
-                    wrapMode: Text.WordWrap
-                    textFormat: Text.PlainText
-                    color: root.cFaint
-                    font.pixelSize: 11
-                    text: root.storage.advertise !== false
-                        ? (root.storageNode
-                           ? "Anyone with a file's CID can fetch it from your node, which is always on, so Storage is public to whoever you give the CID. Keep private files on your dufs servers."
-                           : "Anyone with a file's CID can fetch it from this computer while it is online and reachable, so Storage is public to whoever you give the CID. Keep private files on your dufs servers.")
-                        : "Not announcing: what you put in now stays " + root.storageWhere + ", and others can't fetch it."
                 }
             }
 
@@ -1644,13 +1512,15 @@ Item {
         function popupFor(e) { entry = e; popup() }
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Open" : "Preview"; onTriggered: root.activate(entryMenu.entry) }
         MenuItem { text: entryMenu.entry && entryMenu.entry.dir ? "Download as .zip" : "Download"; enabled: !(entryMenu.entry && entryMenu.entry.dir) || root.st.perms.archive !== false; onTriggered: { root.askSave(entryMenu.entry) } }
-        MenuItem { text: "Copy link"; onTriggered: root.copyText(entryMenu.entry.url) }
-        MenuItem { text: "Copy Basecamp link"; onTriggered: root.copyText(root.basecampLink(entryMenu.entry.url)) }
+        MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Copy link"; onTriggered: root.copyText(entryMenu.entry.url) }
+        MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Copy Basecamp link"; onTriggered: root.copyText(root.basecampLink(entryMenu.entry.url)) }
+        MenuItem { visible: root.isStorage; height: visible ? implicitHeight : 0; text: "Copy CID"; onTriggered: root.copyText(entryMenu.entry.cid) }
         MenuItem { text: entryMenu.entry && root.isPinned(entryMenu.entry.path) ? "Unpin" : "Pin"; onTriggered: root.togglePin(entryMenu.entry.path) }
-        MenuItem { text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
-        MenuItem { text: "Send to Logos Storage"; enabled: !!entryMenu.entry && !entryMenu.entry.dir; onTriggered: root.sendToStorage(entryMenu.entry) }
+        MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Open in browser"; onTriggered: root.openUrl(entryMenu.entry.url) }
+        MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Send to Logos Storage"; enabled: !!entryMenu.entry && !entryMenu.entry.dir; onTriggered: root.sendToStorage(entryMenu.entry) }
+        MenuItem { visible: root.isStorage; height: visible ? implicitHeight : 0; text: "Save to a dufs server…"; enabled: root.dufsServers.length > 0; onTriggered: toServerDialog.ask(entryMenu.entry) }
         MenuSeparator {}
-        MenuItem { text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }
+        MenuItem { visible: !root.isStorage; height: visible ? implicitHeight : 0; text: "Rename"; enabled: root.st.perms.delete !== false; onTriggered: { var e = entryMenu.entry; nameDialog.ask("Rename", e.name, function (n) { root.act("renamePath", [e.path, n]) }) } }
         MenuItem { text: "Delete"; enabled: root.st.perms.delete !== false; onTriggered: confirmDialog.ask(entryMenu.entry) }
     }
 
@@ -1810,7 +1680,8 @@ Item {
             spacing: 10
             Text { text: "Delete " + (confirmDialog.entry ? confirmDialog.entry.name : "") + "?"; color: root.cText; font.pixelSize: 17; font.bold: true; wrapMode: Text.WrapAnywhere; Layout.fillWidth: true; textFormat: Text.PlainText }
             Text {
-                text: confirmDialog.entry && confirmDialog.entry.dir ? "The folder and everything in it is deleted from the server. This cannot be undone." : "The file is deleted from the server. This cannot be undone."
+                text: confirmDialog.entry && confirmDialog.entry.cid ? "The file is removed from the Storage node. Others who fetched it may still have it, and can still share it by its CID."
+                    : confirmDialog.entry && confirmDialog.entry.dir ? "The folder and everything in it is deleted from the server. This cannot be undone." : "The file is deleted from the server. This cannot be undone."
                 color: root.cSub; font.pixelSize: 13; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
             }
             RowLayout {
@@ -1881,22 +1752,6 @@ Item {
 
 
     // ── Logos Storage: menus and dialogs
-    Menu {
-        id: storageMenu
-        property var file: null
-        function popupFor(f) { file = f; popup() }
-        MenuItem { text: "Download…"; onTriggered: root.askSave({ name: storageMenu.file.name, cid: storageMenu.file.cid, dir: false }) }
-        MenuItem { text: "Save to a dufs server…"; enabled: root.servers.length > 0; onTriggered: toServerDialog.ask(storageMenu.file) }
-        MenuItem { text: "Copy CID"; onTriggered: root.copyText(storageMenu.file.cid) }
-        MenuSeparator {}
-        MenuItem { text: "Remove from Storage"; onTriggered: root.act("storageRemove", [storageMenu.file.cid]) }
-    }
-    FileDialog {
-        id: storageUploadDialog
-        title: "Put into Logos Storage"
-        fileMode: FileDialog.OpenFiles
-        onAccepted: root.storeUrls(storageUploadDialog.selectedFiles)
-    }
     Popup {
         id: nodeDialog
         anchors.centerIn: parent
@@ -1907,18 +1762,21 @@ Item {
             elsewhere.checked = !!root.storageNode
             here.checked = !root.storageNode
             nodeField.text = root.storageNode
+            announceBox.checked = root.storage.advertise !== false
         }
         function done() {
             var url = elsewhere.checked ? nodeField.text.trim() : ""
             if (elsewhere.checked && !url) return
             if (url && url.indexOf("://") < 0) url = "http://" + url
             close()
-            root.act("storageSettings", [JSON.stringify({ node: url })], url ? "Using the Storage node at " + url : "Using this computer's Storage node")
+            var changedNode = url !== root.storageNode
+            root.act("storageSettings", [JSON.stringify({ node: url, advertise: announceBox.checked })],
+                     changedNode ? (url ? "Using the Storage node at " + url : "Using this computer's Storage node") : "Saved")
         }
         background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
         contentItem: ColumnLayout {
             spacing: 10
-            Text { text: "Storage node"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
+            Text { text: "Logos Storage"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
             Text {
                 text: "Where your Storage files live. A node on an always-on server with a public address serves them to others all the time; this computer's node only while it is on and reachable."
                 color: root.cSub; font.pixelSize: 13; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
@@ -1960,6 +1818,24 @@ Item {
             Text {
                 visible: elsewhere.checked
                 text: "The node's REST API (logos-storage with --api-bindaddr). It has no password, so it must only be reachable over your VPN or mesh, never on a public address. Files go from this computer to the node and back."
+                color: root.cFaint; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                spacing: 6
+                CheckBox { id: announceBox }
+                Text {
+                    Layout.fillWidth: true
+                    text: "Announce what I put in, so others can fetch it by its CID"
+                    color: root.cText; font.pixelSize: 13; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: announceBox.toggle() }
+                }
+            }
+            Text {
+                text: announceBox.checked
+                    ? "Anyone with a file's CID can fetch it from the node while it is online and reachable, so Storage is public to whoever you give the CID. Keep private files on your dufs servers."
+                    : "Not announcing: what you put in from now on stays on the node, and others can't fetch it."
                 color: root.cFaint; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
             }
             RowLayout {
@@ -2006,13 +1882,13 @@ Item {
         function ask(f) {
             file = f
             var cur = -1
-            for (var i = 0; i < root.servers.length; i++) if (root.servers[i].id === root.st.current) cur = i
+            for (var i = 0; i < root.dufsServers.length; i++) if (root.dufsServers[i].id === root.st.current) cur = i
             serverBox.currentIndex = Math.max(0, cur)
             dirField.text = cur >= 0 ? (root.st.path || "/") : "/"
             open()
         }
         function done() {
-            var s = root.servers[serverBox.currentIndex]
+            var s = root.dufsServers[serverBox.currentIndex]
             if (!s || !file) return
             var dir = dirField.text.trim() || "/"
             if (dir.charAt(0) !== "/") dir = "/" + dir
@@ -2031,8 +1907,8 @@ Item {
             ComboBox {
                 id: serverBox
                 Layout.fillWidth: true
-                model: root.servers.map(function (s) { return s.name })
-                onActivated: dirField.text = root.servers[currentIndex] && root.servers[currentIndex].id === root.st.current ? (root.st.path || "/") : "/"
+                model: root.dufsServers.map(function (s) { return s.name })
+                onActivated: dirField.text = root.dufsServers[currentIndex] && root.dufsServers[currentIndex].id === root.st.current ? (root.st.path || "/") : "/"
             }
             DLabel { text: "Folder" }
             DField { id: dirField; placeholderText: "/"; onAccepted: toServerDialog.done() }

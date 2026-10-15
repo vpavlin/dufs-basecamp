@@ -51011,18 +51011,18 @@
       },
       "locked": {
         "dir": "module",
-        "lastModified": 1792045822,
-        "narHash": "sha256-Tf4GRD0a0SMKkhnD+DIzHt3isY9Od3/e00wvtqbnQAw=",
+        "lastModified": 1792048648,
+        "narHash": "sha256-bNixanFma2Il5Uf2mADVBCWkuIAP8ShJ7cokGyc9/1I=",
         "owner": "vpavlin",
         "repo": "logos-storage-gateway",
-        "rev": "b1f7199ea16e5ba8132a3b4e7cfac7e973f549f6",
+        "rev": "585aba6d22916895856f6830822e04e981b5f51e",
         "type": "github"
       },
       "original": {
         "dir": "module",
         "owner": "vpavlin",
         "repo": "logos-storage-gateway",
-        "rev": "b1f7199ea16e5ba8132a3b4e7cfac7e973f549f6",
+        "rev": "585aba6d22916895856f6830822e04e981b5f51e",
         "type": "github"
       }
     },
