@@ -45,7 +45,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.2.6";
+static const char* kVersion = "0.2.7";
 static const size_t kMaxRecent = 12;
 static const qint64 kMaxImagePreview = 30LL * 1024 * 1024;
 static const qint64 kTextPreviewBytes = 64 * 1024;
@@ -299,6 +299,10 @@ struct DufsCorePrivate {
     std::string query;
     bool loading = false;
     std::string listError;
+    // A folder that answered with a page instead of a listing (a web server, or an index.html):
+    // its address, and what came back (html, md or text) to show in place of the listing.
+    std::string pageUrl, pageKind, pageText;
+    bool pageCut = false;
     json entries = json::array();
     json perms = json::object();
     quint64 listGen = 0;
@@ -548,6 +552,8 @@ struct DufsCorePrivate {
             {"query", query},
             {"loading", loading},
             {"error", listError},
+            {"page", pageUrl.empty() ? json(nullptr)
+                                     : json{{"url", pageUrl}, {"kind", pageKind}, {"text", pageText}, {"truncated", pageCut}}},
             {"entries", entries},
             {"perms", perms},
             {"transfers", tr},
@@ -572,6 +578,7 @@ struct DufsCorePrivate {
         if (listReply) { listReply->abort(); listReply = nullptr; }
         entries = json::array();
         listError.clear();
+        pageUrl.clear(); pageKind.clear(); pageText.clear(); pageCut = false;
         if (onStorage()) {
             ++listGen;
             previews.clear();
@@ -600,21 +607,24 @@ struct DufsCorePrivate {
         QNetworkReply* r = watch(net()->get(request(*s, u, 15000)));
         listReply = r;
         const std::string sid = s->id;
-        QObject::connect(r, &QNetworkReply::finished, guarded("list", [this, r, gen, sid] {
+        const std::string folderUrl = query.empty() ? publicUrl(*s, path) : "";
+        QObject::connect(r, &QNetworkReply::finished, guarded("list", [this, r, gen, sid, folderUrl] {
             r->deleteLater();
             if (gen != listGen) return;
             listReply = nullptr;
             loading = false;
             if (r->error() != QNetworkReply::NoError) {
                 listError = httpError(r);
+                pageUrl = folderUrl;   // still something to open in the browser or copy
                 perms = json::object();
                 changed();
                 return;
             }
-            json j = json::parse(r->readAll().toStdString(), nullptr, false);
+            const QByteArray body = r->readAll();
+            json j = json::parse(body.toStdString(), nullptr, false);
             auto pathsIt = j.is_object() ? j.find("paths") : j.end();
             if (!j.is_object() || pathsIt == j.end() || !pathsIt->is_array()) {
-                listError = "That address answered, but not like a dufs server (no JSON listing).";
+                showPage(r, body, folderUrl);
                 perms = json::object();
                 changed();
                 return;
@@ -651,6 +661,28 @@ struct DufsCorePrivate {
             for (auto& e : files) entries.push_back(e);
             changed();
         }));
+    }
+
+    // The folder answered with something other than a dufs listing: a web server's page (often a
+    // folder's index.html), Markdown or text. Kept to show instead of the listing.
+    void showPage(QNetworkReply* r, const QByteArray& body, const std::string& url)
+    {
+        pageUrl = url;
+        const QString type = r->header(QNetworkRequest::ContentTypeHeader).toString().toLower();
+        const QString file = r->url().path().toLower();
+        if (type.contains("html")) pageKind = "html";
+        else if (type.contains("markdown") || file.endsWith(".md") || file.endsWith(".markdown")) pageKind = "md";
+        else if (type.startsWith("text/") || type.contains("json")) pageKind = "text";
+        const QByteArray head = body.left(kTextPreviewBytes);
+        if (!pageKind.empty() && !looksBinary(head)) {
+            pageText = QString::fromUtf8(head).toStdString();
+            pageCut = body.size() > kTextPreviewBytes;
+        } else {
+            pageKind.clear();
+        }
+        listError = pageKind == "html" ? "This folder is a web page, not a dufs listing."
+                  : !pageKind.empty()  ? "This address gives a document, not a dufs listing."
+                                       : "That address answered, but not like a dufs server (no JSON listing).";
     }
 
     void simpleOp(const QByteArray& verb, const std::string& target, const std::string& destination,
