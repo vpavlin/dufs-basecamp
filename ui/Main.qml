@@ -147,6 +147,8 @@ Item {
     }
     function showWeb(host, body, url) {
         if (!ensureWebView(host)) return
+        // One WebView, shared by the file preview and a folder that is a web page: it moves to whichever asks.
+        if (webView.parent !== host) { webView.parent = host; webView.anchors.fill = host }
         webBase = String(url || ""); webDoc = webHtml(body, originOf(url))
         webView.loadHtml(webDoc, webBase)
     }
@@ -228,12 +230,13 @@ Item {
         flush(); closeList()
         return out.join("\n")
     }
-    // A link in a rendered file: http(s) opens in the browser; a relative one is resolved against the file's own URL.
-    function openMdLink(link) {
+    // A link in a rendered file: http(s) opens in the browser; a relative one is resolved against the
+    // file's own URL (or the given one: a folder that is a page).
+    function openMdLink(link, from) {
         var l = String(link || "")
         if (/^https?:\/\//i.test(l)) { openUrl(l); return }
-        if (!l || l.charAt(0) === "#" || /^[a-z][a-z0-9+.-]*:/i.test(l) || !selectedEntry) return
-        var base = String(selectedEntry.url || "")
+        if (!l || l.charAt(0) === "#" || /^[a-z][a-z0-9+.-]*:/i.test(l) || (!from && !selectedEntry)) return
+        var base = String(from || selectedEntry.url || "")
         var origin = (base.match(/^https?:\/\/[^\/]+/i) || [""])[0]
         if (!origin) return
         openUrl(l.charAt(0) === "/" ? origin + l : base.replace(/[^\/]*$/, "") + l)
@@ -1221,7 +1224,7 @@ Item {
                         anchors.centerIn: parent
                         width: Math.min(parent.width - 48, 460)
                         spacing: 12
-                        visible: !root.currentServer || !!root.st.error || (!root.st.loading && (root.st.entries || []).length === 0)
+                        visible: !pagePane.visible && (!root.currentServer || !!root.st.error || (!root.st.loading && (root.st.entries || []).length === 0))
                         Text {
                             width: parent.width
                             horizontalAlignment: Text.AlignHCenter
@@ -1245,7 +1248,7 @@ Item {
                             font.pixelSize: 13
                             text: !root.coreSeen ? (root.missedPolls > 3 ? "No answer yet. Make sure the Dufs Core module is installed." : "")
                                 : !root.currentServer ? "For example http://pi5.lan:5000. Start dufs with -A to allow uploads, deletes and search."
-                                : root.st.error ? (root.isStorage ? (root.currentServer.remote ? "Check the node's address and that it is reachable over your VPN or mesh (⋯ beside it)." : "Basecamp starts Storage a moment after it opens; if this stays, check that the Storage module is installed.") : root.currentServer ? root.currentServer.url : "")
+                                : root.st.error ? (root.isStorage ? (root.currentServer.remote ? "Check the node's address and that it is reachable over your VPN or mesh (⋯ beside it)." : "Basecamp starts Storage a moment after it opens; if this stays, check that the Storage module is installed.") : root.st.page ? root.st.page.url : root.currentServer ? root.currentServer.url : "")
                                 : root.st.query ? ""
                                 : root.isStorage ? "Drop files here, upload them, send a file from a dufs server (its ⋯ menu), or add one someone shared by its CID."
                                 : (root.st.perms.upload !== false ? "Drop files here to upload them." : "")
@@ -1255,6 +1258,86 @@ Item {
                             visible: root.coreSeen && (!root.currentServer || !!root.st.error)
                             text: !root.currentServer ? "Add server" : "Try again"
                             onClicked: !root.currentServer ? serverDialog.openFor(null) : root.act("refresh", [])
+                        }
+                        // The folder's address, for the browser: whatever went wrong here may work there.
+                        Row {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            spacing: root.sp
+                            visible: !root.isStorage && !!root.st.error && !!root.st.page
+                            LogosButton { width: 130; height: 34; text: "Open in browser"; onClicked: root.openUrl(root.st.page.url) }
+                            LogosButton { width: 96; height: 34; text: "Copy link"; onClicked: root.copyText(root.st.page.url) }
+                        }
+                    }
+
+                    // A folder that answered with a page (a web server, or its index.html) instead of a
+                    // listing: shown here, with its address to open or copy.
+                    Rectangle {
+                        id: pagePane
+                        readonly property var page: root.st.page || null
+                        readonly property string body: page && page.text ? page.text : ""
+                        readonly property bool html: !!page && page.kind === "html"
+                        readonly property bool rendered: !!page && (page.kind === "html" || page.kind === "md")
+                        anchors.fill: parent
+                        visible: !root.isStorage && !!root.currentServer && !!body
+                        color: root.cBg
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: root.sp
+                            spacing: root.sp
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: root.sp
+                                LogosButton { visible: root.st.path !== "/"; Layout.preferredWidth: 72; Layout.preferredHeight: 34; text: "← Up"; onClicked: root.goUp() }
+                                Text {
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideMiddle
+                                    textFormat: Text.PlainText
+                                    color: root.cFaint
+                                    font.pixelSize: 12
+                                    text: (pagePane.html ? "A web page, not a dufs listing: " : "A document, not a dufs listing: ") + (pagePane.page ? pagePane.page.url : "")
+                                }
+                                LogosButton { Layout.preferredWidth: 130; Layout.preferredHeight: 34; text: "Open in browser"; onClicked: root.openUrl(pagePane.page.url) }
+                                LogosButton { Layout.preferredWidth: 96; Layout.preferredHeight: 34; text: "Copy link"; onClicked: root.copyText(pagePane.page.url) }
+                                LogosButton { Layout.preferredWidth: 130; Layout.preferredHeight: 34; text: "Basecamp link"; onClicked: root.copyText(root.basecampLink(pagePane.page.url)) }
+                            }
+                            Item {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                ScrollView {
+                                    id: pageScroll
+                                    anchors.fill: parent
+                                    visible: !pageWeb.visible
+                                    background: Rectangle { radius: 6; color: pagePane.html ? "#fbfbf9" : root.cSurface }
+                                    contentWidth: availableWidth
+                                    contentHeight: pageText.implicitHeight
+                                    onVisibleChanged: contentItem.contentY = 0
+                                    TextEdit {
+                                        id: pageText
+                                        width: pageScroll.availableWidth
+                                        padding: 10
+                                        readOnly: true
+                                        selectByMouse: true
+                                        wrapMode: TextEdit.Wrap
+                                        color: pagePane.html ? "#1d1d1f" : root.cText
+                                        font.pixelSize: 13
+                                        font.family: pagePane.rendered ? Qt.application.font.family : "monospace"
+                                        textFormat: pagePane.rendered ? TextEdit.RichText : TextEdit.PlainText
+                                        text: !pagePane.body ? ""
+                                            : (pagePane.html ? root.htmlForView(pagePane.body)
+                                               : pagePane.rendered ? root.mdToHtml(pagePane.body) : pagePane.body)
+                                              + (pagePane.page && pagePane.page.truncated ? (pagePane.rendered ? "<hr><p><i>First 64 KB shown</i></p>" : "\n\n[first 64 KB shown]") : "")
+                                        onLinkActivated: (link) => root.openMdLink(link, pagePane.page.url)
+                                        HoverHandler { cursorShape: pageText.hoveredLink ? Qt.PointingHandCursor : Qt.IBeamCursor }
+                                    }
+                                }
+                                Item {
+                                    id: pageWeb
+                                    anchors.fill: parent
+                                    visible: pagePane.visible && pagePane.html && root.webOk
+                                    readonly property string key: pagePane.visible && pagePane.html ? pagePane.page.url + "|" + pagePane.body.length : ""
+                                    onKeyChanged: if (key) root.showWeb(pageWeb, pagePane.body, pagePane.page.url)
+                                }
+                            }
                         }
                     }
                     Rectangle {
